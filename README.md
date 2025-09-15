@@ -111,6 +111,9 @@ Miopoint is powered by a FastAPI backend, which includes beautiful, interactive 
 -   **Swagger UI**: `http://127.0.0.1:8000/docs`
 -   **ReDoc**: `http://127.0.0.1:8000/redoc`
 
+
+🔗 **If you want a Webui:** [delta-dash/MioPoint-frontend](https://github.com/delta-dash/MioPoint-frontend)
+
 ## 🤝 Contributing
 
 We welcome contributions of all kinds! If you'd like to help improve Miopoint, please follow these steps:
