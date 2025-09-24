@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger("ConfigRoutes")
 logger.setLevel(logging.DEBUG)
 config_manager = get_config()
-router = APIRouter()
+router = APIRouter(prefix="/api")
 
 @router.get("/config/schema", response_model=List[Dict[str, Any]])
 @require_permission_from_profile(Permission.ADMIN_CONFIG_VIEW)
@@ -50,13 +50,12 @@ async def update_configuration(updates: Dict[str, Any], current_user: UserProfil
     logger.info(f"User {current_user.username} attempting to update config with: {updates}")
     
     if not updates:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No configuration updates provided.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, message="No configuration updates provided.")
 
     try:
         config_manager.update_config(updates)
-        config_manager.reload()
         logger.info(f"Configuration updated successfully by {current_user.username}.")
         return {"message": "Configuration updated successfully", "new_config": config_manager.data}
     except Exception as e:
         logger.error(f"Failed to update configuration: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update configuration: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, message=f"Failed to update configuration: {e}")

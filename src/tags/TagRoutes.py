@@ -1,9 +1,10 @@
 #TagRoutes.py
 import aiosqlite
 from enum import Enum
+from TaskManager import Priority, task_registry
 from typing import List, Union, Optional, Callable, Any
 from functools import wraps
-import inspect
+import inspect, asyncio
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status, Path
 from pydantic import BaseModel, Field
@@ -12,8 +13,8 @@ from pydantic import BaseModel, Field
 
 from ConfigMedia import get_config
 import logging
-from src.media.actions import retag_file
 from src.models import UserProfile
+from processing_status import status_manager
 
 logger = logging.getLogger("TagService")
 logger.setLevel(logging.DEBUG)
@@ -30,15 +31,10 @@ from src.tags.HelperTags import (
     remove_tag,
     get_tag_data,
     assign_tags_to_file,
-    unassign_tags_from_file
+    unassign_tags_from_file,
 )
-from src.db_utils import get_db_connection
+from src.db_utils import get_db_connection, execute_db_query
 from src.users.auth_dependency import get_current_active_user
-
-from ImageTagger import get_tagger
-from ClipManager import get_clip_manager
-
-tagging_progress_cache = {}
 
 # --- API Router Setup ---
 router = APIRouter(prefix='/api', tags=["Tags"])
@@ -201,91 +197,123 @@ async def delete_tag_route(
 
 # --- File Tagging Routes ---
 
-@router.post("/tags/{tag_type}/file/{file_id}", status_code=status.HTTP_200_OK, summary="Assign tags to a file")
+@router.post("/tags/{tag_type}/instance/{instance_id}", status_code=status.HTTP_200_OK, summary="Assign tags to a file's content")
 @require_permission_from_profile(permission=Permission.TAG_EDIT)
 async def assign_tags_to_file_route(
-    file_id: int,
+    instance_id: int,
     tag_type: TagType,
     request: TagAssignmentRequest,
     current_user: UserProfile = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_connection)
 ):
     """
-    Assigns one or more tags to a file. Requires 'tag:edit' permission.
+    Assigns one or more tags to a file's content, identified by its instance ID. Requires 'tag:edit' permission.
     """
-    success = await assign_tags_to_file(file_id, request.tags, tag_type.value, conn)
+    success = await assign_tags_to_file(instance_id, request.tags, tag_type.value, conn)
     if not success:
-        raise HTTPException(status_code=400, detail="Failed to assign tags. One or more tags may not exist.")
-    return {"message": f"Tags successfully assigned to file {file_id}."}
+        raise HTTPException(status_code=400, detail="Failed to assign tags. The instance or one or more tags may not exist.")
+    return {"message": f"Tags successfully assigned to content of instance {instance_id}."}
 
-@router.delete("/tags/{tag_type}/file/{file_id}", status_code=status.HTTP_200_OK, summary="Unassign tags from a file")
+@router.delete("/tags/{tag_type}/instance/{instance_id}", status_code=status.HTTP_200_OK, summary="Unassign tags from a file's content")
 @require_permission_from_profile(permission=Permission.TAG_EDIT)
 async def unassign_tags_from_file_route(
-    file_id: int,
+    instance_id: int,
     tag_type: TagType,
     request: TagAssignmentRequest,
     current_user: UserProfile = Depends(get_current_active_user),
     conn: aiosqlite.Connection = Depends(get_db_connection)
 ):
     """
-    Unassigns one or more tags from a file. Requires 'tag:edit' permission.
+    Unassigns one or more tags from a file's content, identified by its instance ID. Requires 'tag:edit' permission.
     """
-    await unassign_tags_from_file(file_id, request.tags, tag_type.value, conn)
-    return {"message": f"Tags successfully unassigned from file {file_id}."}
+    await unassign_tags_from_file(instance_id, request.tags, tag_type.value, conn)
+    return {"message": f"Tags successfully unassigned from content of instance {instance_id}."}
 
 
+async def _run_retagging_in_background(instance_id: int):
+    """Helper coroutine to load models and run the retagging process."""
+    from src.media.actions import retag_file
+    from ImageTagger import get_tagger
+    from ClipManager import get_clip_manager
+    from ConfigMedia import get_config
 
+    # This is a background task, so we can do heavy work like loading models.
+    try:
+        config_data = get_config()
+        tagger = await get_tagger(config_data["MODEL_TAGGER"])
+        clip_manager = get_clip_manager()
+        clip_model, clip_preprocess = await clip_manager.load_or_get_model(config_data["MODEL_REVERSE_IMAGE"])
 
-@router.post("/files/{file_id}/auto-tag", status_code=202)
+        if not clip_model:
+            logger.error(f"CLIP model is not available for retagging instance {instance_id}.")
+            status_manager.set_error(instance_id, "CLIP model not available.")
+            return
+
+        # Now we can await the actual retagging function
+        await retag_file(
+            instance_id=instance_id,
+            tagger_model_name=config_data["MODEL_TAGGER"],
+            clip_model_name=config_data["MODEL_REVERSE_IMAGE"],
+            tagger=tagger,
+            clip_model=clip_model,
+            clip_preprocess=clip_preprocess
+        )
+    except Exception as e:
+        logger.exception(f"Error during background retagging for instance {instance_id}: {e}")
+        status_manager.set_error(instance_id, f"Retagging failed: {str(e)}")
+
+@router.post("/instance/{instance_id}/auto-tag", status_code=202)
 @require_permission_from_profile(Permission.TAG_EDIT)
 async def trigger_auto_tagging(
-    file_id: int,
+    instance_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
-    current_user: UserProfile = Depends(get_current_active_user)
+    current_user: UserProfile = Depends(get_current_active_user),
+    conn: aiosqlite.Connection = Depends(get_db_connection)
 ):
-    """Triggers the automatic tagging process for a specific file."""
-    if file_id in tagging_progress_cache and isinstance(tagging_progress_cache[file_id], (int, float)) and tagging_progress_cache[file_id] < 100:
+    """Triggers the automatic tagging process for a specific file instance."""
+    # Check if a re-tagging task is already running for this instance
+    current_status = status_manager.get_status(instance_id)
+    if current_status and current_status.get("ingest_source") == 'retagging' and current_status.get("status") not in ["completed", "error"]:
         raise HTTPException(status_code=409, detail="Tagging for this file is already in progress.")
 
-    scanner_state = request.app.state.scanner
-    if not scanner_state or 'executor' not in scanner_state:
-        raise HTTPException(status_code=503, detail="Scanner service is not available.")
+    # Determine the correct worker pool based on file type
+    details = await execute_db_query(conn, "SELECT fc.file_type FROM file_instances fi JOIN file_content fc ON fi.content_id = fc.id WHERE fi.id = ?", (instance_id,), fetch_one=True)
+    if not details:
+        raise HTTPException(status_code=404, detail="Instance not found.")
 
-    executor = scanner_state['executor']
-    
-    # Get models
-    config_data = get_config()
-    tagger = await get_tagger(config_data["MODEL_TAGGER"])
-    clip_manager = get_clip_manager()
-    clip_model, clip_preprocess = await clip_manager.load_or_get_model(config_data["MODEL_REVERSE_IMAGE"])
+    file_type = details['file_type']
+    if file_type == 'image':
+        manager_name = 'image'
+    elif file_type == 'video':
+        manager_name = 'video'
+    else:
+        raise HTTPException(status_code=400, detail=f"Auto-tagging is not supported for file type '{file_type}'.")
 
-    if not clip_model:
-        raise HTTPException(status_code=503, detail="CLIP model is not available.")
+    try:
+        manager = task_registry.get_manager(manager_name)
+        if manager.num_workers <= 0:
+            raise HTTPException(status_code=503, detail=f"Processing for type '{manager_name}' is disabled. Cannot queue auto-tagging task.")
+    except RuntimeError as e:
+        logger.error(f"Could not get task manager '{manager_name}': {e}")
+        raise HTTPException(status_code=503, detail=f"Task manager for type '{manager_name}' is not available.")
 
-    background_tasks.add_task(
-        retag_file,
-        file_id=file_id,
-        executor=executor,
-        tagger_model_name=config_data["MODEL_TAGGER"],
-        clip_model_name=config_data["MODEL_REVERSE_IMAGE"],
-        tagger=tagger,
-        clip_model=clip_model,
-        clip_preprocess=clip_preprocess,
-        progress_cache=tagging_progress_cache
-    )
+    # Schedule the background task on the appropriate worker pool without awaiting the result.
+    # The `schedule_task` method returns a future that resolves when the task is complete.
+    # We use `asyncio.create_task` to run it in the background ("fire and forget").
+    asyncio.create_task(manager.schedule_task(
+        func=_run_retagging_in_background,
+        args=(instance_id,),
+        kwargs={},
+        priority=Priority.NORMAL
+    ))
 
-    return {"status": "queued", "message": f"File {file_id} has been queued for auto-tagging."}
+    return {"status": "queued", "message": f"File instance {instance_id} has been queued for auto-tagging."}
 
-@router.get("/files/{file_id}/tagging-status")
+@router.get("/instance/{instance_id}/tagging-status")
 @require_permission_from_profile(Permission.FILE_VIEW)
-async def get_tagging_status(file_id: int, current_user: UserProfile = Depends(get_current_active_user)):
-    """Checks the tagging status of a file."""
-    progress = tagging_progress_cache.get(file_id)
-    if progress is None:
+async def get_tagging_status(instance_id: int, current_user: UserProfile = Depends(get_current_active_user)):
+    """Checks the tagging status of a file instance."""
+    status = status_manager.get_status(instance_id)
+    if not status:
         return {"status": "not_started"}
-    if isinstance(progress, dict) and progress.get("status") == "error":
-        return progress
-    if progress == 100:
-        return {"status": "complete", "progress": 100}
-    return {"status": "in_progress", "progress": progress}
+    return status

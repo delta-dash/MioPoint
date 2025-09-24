@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import socket
 import sys
+import signal
 
 
 # Uvicorn and project-specific imports
@@ -19,10 +21,27 @@ from src.roles import start_role_db
 from src.tags.HelperTags import setup_tags_database_with_loop_async
 from src.users.user_manager import setup_user_database
 
+
+
+#root_logger.addHandler(handler)
+
+# Silence noisy third-party loggers
+logging.getLogger("watchdog").setLevel(logging.INFO)
+logging.getLogger("aiosqlite").setLevel(logging.INFO)
+
+
+# --- Global Shutdown Event ---
+shutdown_event = asyncio.Event()
+
+def signal_handler(sig, frame):
+    """Sets the shutdown event when a signal is received."""
+    logger.warning(f"Caught signal {sig}. Initiating graceful shutdown...")
+    asyncio.get_running_loop().call_soon_threadsafe(shutdown_event.set)
+
+
 # --- Logger Setup ---
 logger = logging.getLogger("Startup")
 logger.setLevel(logging.DEBUG)
-
 
 # --- Phase 1: Initial Async Check ---
 async def run_initial_setup_and_check() -> bool:
@@ -51,6 +70,8 @@ async def run_kivy_app_async(app):
     """
     from kivy.base import EventLoop
     from kivy.clock import Clock
+    from kivy.logger import Logger, LOG_LEVELS
+    Logger.setLevel(LOG_LEVELS["warning"])
 
     await app.async_run()  # This builds the window but doesn't block the program
 
@@ -132,30 +153,21 @@ async def confirm_admin_creation() -> bool:
         logger.critical("Admin user was NOT created after running the UI. Shutting down.")
         return False
 
-
-# --- Phase 4: Main Application Async Task ---
-async def start_server():
-    """Sets up and runs the Uvicorn server programmatically."""
-    logger.info("--- Phase 4: Starting FastAPI Server ---")
-
-    config = Config(
-        app=app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        # Set reload to True for development, False for production
-        reload=not IS_PRODUCTION
-    )
-    server = Server(config)
-
-    await server.serve()
-    logger.info("Server has been shut down.")
-
+def find_free_port(start_port=8000, max_port=9000):
+    """Return a free port in the given range, or raise if none found."""
+    for port in range(start_port, max_port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return port  # Port is free
+            except OSError:
+                continue
+    raise RuntimeError(f"No free ports between {start_port}-{max_port}")
 
 # --- Main Async Orchestrator ---
 async def main():
     """The main asynchronous entry point for the entire application."""
-
+    port = 8000#find_free_port()
     # Phase 1
     admin_exists = await run_initial_setup_and_check()
 
@@ -169,18 +181,49 @@ async def main():
     else:
         logger.info("Admin user found. Proceeding with startup.")
 
-    # Phase 4
-    await start_server()
+    # Phase 4: Start and manage the server
+    logger.info("--- Phase 4: Starting FastAPI Server ---")
+    config = Config(
+        app=app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        reload=False,
+        lifespan="on" # Explicitly use lifespan protocol
+    )
+    server = Server(config)
+
+    # Run the server in a background task
+    server_task = asyncio.create_task(server.serve())
+
+    # Wait for the shutdown signal (e.g., from CTRL+C)
+    await shutdown_event.wait()
+
+    # Gracefully shut down the server
+    logger.info("Shutdown signal received. Telling Uvicorn server to exit.")
+    server.should_exit = True
+
+    # Wait for the server task to complete. This allows Uvicorn to finish
+    # its shutdown sequence, including closing connections.
+    await server_task
+    logger.info("Server task has completed. Main application will now exit.")
 
 
 # --- Main Synchronous Entry Point ---
 if __name__ == "__main__":
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     try:
         # Start the entire application with a single, top-level asyncio.run() call.
         asyncio.run(main())
-    except SystemExit as e:
-        logger.error(f"Application startup halted: {e}")
-        sys.exit(1)
+    except (SystemExit, KeyboardInterrupt):
+        # The main() function now handles graceful shutdown, so we only expect
+        # exceptions here if something went wrong during startup.
+        pass # The specific error will have already been logged.
     except Exception as e:
         logger.critical(f"An unhandled exception occurred during startup: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        logger.info("Application has finished.")

@@ -1,219 +1,41 @@
 # scanner_service.py
-# This script is the core processor for the media tagging system.
-# It performs the following actions:
-# 1. Watches a directory for new image and video files.
-# 2. Uses a single "intake" queue for discovered files.
-# 3. Employs a pool of dispatcher workers to route files to the appropriate manager.
-# 4. Uses dedicated Image and Video Processing Managers (from Manager*.py) to handle
-#    task scheduling, priority, and concurrency for each media type.
-# 5. A concurrency setting of 0 for a media type will disable processing for it.
-# 6. For images: tags the image and stores the tags in the database. Animated GIFs are preserved.
-# 7. For videos: detects scenes, tags a frame from each scene, and stores scene-specific data.
-# 8. All metadata is stored in a single, unified SQLite database via MediaDB.py.
-# 9. Manages ONNX model lifecycle, unloading them when idle to free VRAM.
-# 10. Features colored, prefixed logging for clear, organized output from concurrent workers.
-# 11. Configuration is loaded from config.ini and can be changed at runtime.
-
-
-
-# Import Managers and Priority Enums
-# This now uses the global singleton instance from TaskManager.py
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import functools
 import logging
 import os
-import time
+import signal
+from concurrent.futures import ThreadPoolExecutor
+
 from watchdog.observers import Observer
 
-from watchdog.events import FileSystemEventHandler
-import signal
-import magic
-from ClipManager import get_clip_manager
 from ConfigMedia import ConfigChangeHandler, ConfigManager, get_config
-from ImageTagger import IDLE_UNLOAD_SECONDS, get_tagger, _cache_lock, _model_cache
-from TaskManager import task_registry, Priority
+from TaskManager import task_registry
 from build_index import build_faiss_index
-from src.media.FileProcessors import process_image_task, process_video_task
+from src.media.dispatcher import dispatcher_worker
+from src.media.scanner import Scanner
 from src.roles.rbac_manager import get_role_by_name
-
-
-magic_identifier = magic.Magic(mime=True)
-
-# --- UPDATED: Standard logger setup ---
-# Assuming you configure the root logger elsewhere (e.g., adding handlers, formatters)
-# For standalone script, this is a good place for basic config.
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 logger = logging.getLogger("System")
 logger.setLevel(logging.INFO)
 
-processed_files = set()
-processing_queue = asyncio.Queue() # This is now the "intake" queue
 app_state = {
     "config": None,
-    "media_observer": None,
+    "scanner": None,
     "processing_enabled_event": asyncio.Event(),
     "shutdown_event": asyncio.Event(),
     "executor": None,
-    "intake_queue": processing_queue,
+    "intake_queue": asyncio.Queue(),
     "default_visibility_role_ids": [],
+    "processing_hashes": set(),
+    "processing_lock": asyncio.Lock(),
+    "files_processed_session": 0,
+    "currently_processing": set(),
+    "session_stats_lock": asyncio.Lock(),
 }
+app_state["service_handles"] = {}
 _app_state_lock = asyncio.Lock()
 
-MIN_AGE_SECONDS = 5
-IDLE_TIMEOUT = 1000 # This seems unused in your code, but I'll leave it
 
-
-def safe_to_process(path: str) -> bool:
-    try: return (time.time() - os.path.getmtime(path)) >= MIN_AGE_SECONDS
-    except FileNotFoundError: return False
-
-def is_media_file(path: str) -> bool:
-    if not os.path.isfile(path) or path.endswith(('.crdownload', '.tmp', '.part')):
-        return False
-    try:
-        mime_type = magic_identifier.from_file(path)
-        return mime_type.startswith('image/') or mime_type.startswith('video/')
-    except magic.MagicException as e:
-        logger.warning(f"Could not identify file type for {os.path.basename(path)}: {e}")
-        return False
-    except Exception:
-        return False
-
-async def model_cleanup_task():
-    while True:
-        await asyncio.sleep(300)
-        logger.info("Checking for idle models to unload...")
-        current_time = time.time()
-        async with _cache_lock:
-            models_to_unload = [t for t in _model_cache.values() if t.is_loaded() and (current_time - t.last_used) > IDLE_UNLOAD_SECONDS]
-            for tagger in models_to_unload: tagger.unload()
-
-
-class MediaHandler(FileSystemEventHandler):
-    def __init__(self, loop, queue):
-        self.loop = loop
-        self.queue = queue
-    def _handle_event(self, path):
-        if not is_media_file(path) or path in processed_files or not os.path.isfile(path): return
-        logger.info(f"Discovered: {os.path.basename(path)}")
-        ingest_info = (path, "watcher")
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, ingest_info)
-        processed_files.add(path)
-    def on_modified(self, event): self._handle_event(event.src_path)
-    def on_moved(self, event): self._handle_event(event.dest_path)
-
-async def initial_scan(queue: asyncio.Queue, watch_dirs: list):
-    logger.info("Performing initial directory scan...")
-    count = 0
-    for directory in watch_dirs:
-        if not os.path.isdir(directory):
-            logger.warning(f"Skipping initial scan for non-existent directory: {directory}")
-            continue
-        logger.info(f"Scanning: {directory}")
-        for filename in os.listdir(directory):
-            full_path = os.path.join(directory, filename)
-            if os.path.isfile(full_path) and is_media_file(full_path) and safe_to_process(full_path) and full_path not in processed_files:
-                logger.info(f"Queuing from initial scan: {os.path.basename(full_path)}")
-                ingest_info = (full_path, "folder scan")
-                await queue.put(ingest_info)
-                processed_files.add(full_path)
-                count += 1
-    logger.info(f"Initial scan complete. Queued {count} files for processing.")
-
-
-
-async def dispatcher_worker(name: str, queue: asyncio.Queue, executor: ThreadPoolExecutor):
-    """
-    Pulls files from the intake queue, identifies their type, and dispatches them
-    to the appropriate worker pool via the TaskManagerRegistry.
-    """
-    # --- UPDATED: Standard logger creation ---
-    dispatcher_logger = logging.getLogger(name)
-    dispatcher_logger.setLevel(logging.DEBUG)
-    loop = asyncio.get_running_loop()
-    dispatcher_logger.debug("Ready and waiting for intake tasks.")
-
-    while True:
-        await app_state["processing_enabled_event"].wait()
-
-        ingest_data = await queue.get()
-        path, ingest_source, *extra = ingest_data # Handle variable-length tuples
-        uploader_id = extra[0] if extra else None
-
-        if not path:
-            queue.task_done()
-            continue
-
-        try:
-            mime_type = await loop.run_in_executor(executor, magic_identifier.from_file, path)
-            manager_name = None
-            target_task_func = None
-
-            if mime_type.startswith('image/'):
-                manager_name = "image"
-                target_task_func = process_image_task
-            elif mime_type.startswith('video/'):
-                manager_name = "video"
-                target_task_func = process_video_task
-
-            if not manager_name:
-                # --- UPDATED: Log directly with context in the message ---
-                dispatcher_logger.warning(f"Skipping: Unknown mime type '{mime_type}'.")
-                continue
-
-            manager = task_registry.get_manager(manager_name)
-            if manager.max_workers <= 0:
-                # --- UPDATED: Log directly with context in the message ---
-                dispatcher_logger.info(f"Skipping: Processing for type '{manager_name}' is disabled.")
-                if path in processed_files: processed_files.remove(path)
-                continue
-
-            # --- UPDATED: Log directly with context in the message ---
-            dispatcher_logger.info(f"Dispatching '{os.path.basename(path)}' (from {ingest_source}) to '{manager_name}' pool.")
-
-            async with _app_state_lock:
-                current_config = app_state["config"]
-                default_role_ids = app_state["default_visibility_role_ids"]
-
-            tagger = await get_tagger(current_config["MODEL_TAGGER"])
-            clip_manager = get_clip_manager()
-            clip_model, clip_preprocess = await clip_manager.load_or_get_model(current_config["MODEL_REVERSE_IMAGE"])
-
-            if not clip_model:
-                 # --- UPDATED: Log directly ---
-                dispatcher_logger.error(f"Could not load CLIP model. Skipping task for {os.path.basename(path)}.")
-                continue
-
-            # --- Create the final task function with all its arguments ---
-            actual_task_func = functools.partial(
-                target_task_func,
-                executor=executor, path=path, ingest_source=ingest_source,
-                tagger_model_name=current_config["MODEL_TAGGER"], clip_model_name=current_config["MODEL_REVERSE_IMAGE"],
-                tagger=tagger, clip_model=clip_model, clip_preprocess=clip_preprocess,
-                uploader_id=uploader_id,default_visibility_roles=default_role_ids
-            )
-            actual_task_func.__name__ = f"{target_task_func.__name__}_{os.path.basename(path)}"
-
-            priority = Priority.HIGH if ingest_source == "watcher" else Priority.NORMAL
-            
-            # --- UPDATED: Schedule the task directly, no more context wrapper ---
-            await manager.schedule_task(actual_task_func, args=(), kwargs={}, priority=priority)
-
-        except (FileNotFoundError, magic.MagicException) as e:
-            # --- UPDATED: Log directly ---
-            dispatcher_logger.warning(f"File vanished or unreadable before dispatch, skipping: {path} ({e})")
-        except asyncio.CancelledError:
-            dispatcher_logger.info("Dispatcher task cancelled.")
-            break
-        except Exception:
-            dispatcher_logger.exception(f"A critical top-level error occurred while dispatching {path}")
-        finally:
-            queue.task_done()
-
-
-async def update_application_state(config_manager: ConfigManager, queue: asyncio.Queue, first_run: bool = False):
+async def update_application_state(config_manager: ConfigManager, first_run: bool = False):
     """Atomically updates the application's running state by reconfiguring the TaskManagerRegistry."""
     async with _app_state_lock:
         if not first_run:
@@ -233,7 +55,6 @@ async def update_application_state(config_manager: ConfigManager, queue: asyncio
             else:
                 logger.warning(f"Default visibility role '{role_name}' from config not found in database. It will be ignored.")
 
-        # If after checking all names, the list is empty, default to Everyone
         if not resolved_role_ids:
             everyone_role = await get_role_by_name("Everyone")
             if everyone_role:
@@ -245,30 +66,39 @@ async def update_application_state(config_manager: ConfigManager, queue: asyncio
 
         old_img_concurrency = old_config.get("IMAGE_GPU_CONCURRENCY", -1)
         old_vid_concurrency = old_config.get("VIDEO_GPU_CONCURRENCY", -1)
-        new_img_concurrency = new_config["IMAGE_GPU_CONCURRENCY"]
-        new_vid_concurrency = new_config["VIDEO_GPU_CONCURRENCY"]
+        old_vid_conversion_concurrency = old_config.get("VIDEO_CONVERSION_GPU_CONCURRENCY", -1)
+        old_txt_concurrency = old_config.get("TEXT_CPU_CONCURRENCY", -1)
+        old_gen_concurrency = old_config.get("GENERIC_CPU_CONCURRENCY", -1)
+        
+        new_img_concurrency = new_config.get("IMAGE_GPU_CONCURRENCY", 0)
+        new_vid_concurrency = new_config.get("VIDEO_GPU_CONCURRENCY", 0)
+        new_vid_conversion_concurrency = new_config.get("VIDEO_CONVERSION_GPU_CONCURRENCY", 1)
+        new_txt_concurrency = new_config.get("TEXT_CPU_CONCURRENCY", 2)
+        new_gen_concurrency = new_config.get("GENERIC_CPU_CONCURRENCY", 2)
 
-        if first_run or old_img_concurrency != new_img_concurrency or old_vid_concurrency != new_vid_concurrency:
+        if (first_run or 
+            old_img_concurrency != new_img_concurrency or 
+            old_vid_concurrency != new_vid_concurrency or
+            old_vid_conversion_concurrency != new_vid_conversion_concurrency or
+            old_txt_concurrency != new_txt_concurrency or
+            old_gen_concurrency != new_gen_concurrency):
             if not first_run:
-                # 1. Stop all current worker tasks gracefully.
                 logger.info("Concurrency settings changed. Stopping all worker pools...")
-                await task_registry.stop_all()
+                # Clear is now an async method that handles stopping everything gracefully.
+                await task_registry.clear()
 
-                # 2. Clear the old manager instances from the registry.
-                task_registry.clear()
-
-            # 3. Configure new manager instances based on the new settings.
-            logger.info(f"Configuring pools: Images({new_img_concurrency}), Videos({new_vid_concurrency})")
+            logger.info(f"Configuring pools: Images({new_img_concurrency}), Videos({new_vid_concurrency}), VideoConversions({new_vid_conversion_concurrency}), Text({new_txt_concurrency}), Generic({new_gen_concurrency}))")
             task_pools_config = {
                 "image": {"workers": new_img_concurrency},
-                "video": {"workers": new_vid_concurrency}
+                "video": {"workers": new_vid_concurrency},
+                "video-conversion": {"workers": new_vid_conversion_concurrency},
+                "text": {"workers": new_txt_concurrency},
+                "generic": {"workers": new_gen_concurrency}
             }
             task_registry.configure_from_dict(task_pools_config)
-
-            # 4. Start the workers for the newly configured managers.
             task_registry.start_all()
 
-        if new_img_concurrency > 0 or new_vid_concurrency > 0:
+        if new_img_concurrency > 0 or new_vid_concurrency > 0 or new_txt_concurrency > 0 or new_gen_concurrency > 0:
             if not app_state["processing_enabled_event"].is_set():
                 logger.info("Processing is now ENABLED. Dispatchers are resuming.")
             app_state["processing_enabled_event"].set()
@@ -277,103 +107,147 @@ async def update_application_state(config_manager: ConfigManager, queue: asyncio
                 logger.warning("All processing is now DISABLED. Dispatchers will pause.")
             app_state["processing_enabled_event"].clear()
 
-        image_processing_just_enabled = old_img_concurrency == 0 and new_img_concurrency > 0
-        video_processing_just_enabled = old_vid_concurrency == 0 and new_vid_concurrency > 0
-        if not first_run and (image_processing_just_enabled or video_processing_just_enabled):
+        image_processing_just_enabled = old_img_concurrency <= 0 and new_img_concurrency > 0
+        video_processing_just_enabled = old_vid_concurrency <= 0 and new_vid_concurrency > 0
+        text_processing_just_enabled = old_txt_concurrency <= 0 and new_txt_concurrency > 0
+        generic_processing_just_enabled = old_gen_concurrency <= 0 and new_gen_concurrency > 0
+        if not first_run and (image_processing_just_enabled or video_processing_just_enabled or text_processing_just_enabled or generic_processing_just_enabled):
             logger.info("A processing type was enabled. Triggering a re-scan...")
-            asyncio.create_task(initial_scan(queue, new_config["WATCH_DIRS"]))
+            scanner = app_state.get("scanner")
+            if scanner:
+                asyncio.create_task(scanner.initial_scan())
 
         old_clip_model_name = old_config.get("MODEL_REVERSE_IMAGE")
         new_clip_model_name = new_config["MODEL_REVERSE_IMAGE"]
         if first_run or old_clip_model_name != new_clip_model_name:
             logger.info(f"CLIP model configuration changed to: '{new_clip_model_name}'.")
-            clip_manager = get_clip_manager()
-            await clip_manager.load_or_get_model(new_clip_model_name)
-            if first_run:
-                await clip_manager.configure_idle_cleanup(IDLE_TIMEOUT)
+            
 
-        loop = asyncio.get_running_loop()
         old_watch_dirs = set(old_config.get("WATCH_DIRS", []))
         new_watch_dirs = set(new_config["WATCH_DIRS"])
         if first_run or old_watch_dirs != new_watch_dirs:
             logger.info(f"Updating watched directories to: {list(new_watch_dirs)}")
-            if app_state.get("media_observer"):
-                app_state["media_observer"].stop()
-                app_state["media_observer"].join(timeout=2.0)
-            observer = Observer()
-            handler = MediaHandler(loop, queue)
-            for path in new_watch_dirs:
-                if os.path.isdir(path):
-                    observer.schedule(handler, path=path, recursive=False)
-                else:
-                    logger.warning(f"Watch directory does not exist, skipping: {path}")
-            app_state["media_observer"] = observer
+            if app_state.get("scanner"):
+                app_state["scanner"].stop_watching()
+            
+            scanner = Scanner(app_state["intake_queue"], new_watch_dirs)
+            app_state["scanner"] = scanner
 
         logger.info("Application state update complete.")
 
-async def periodic_index_builder():
-    """A background task that periodically rebuilds the FAISS index."""
-    # --- UPDATED: Standard logger creation ---
-    builder_logger = logging.getLogger("IndexBuilder")
-    builder_logger.setLevel(logging.INFO)
+async def warmup_and_unload_models(config: dict):
+    """
+    Pre-compiles models on the main thread to prevent deadlocks, then unloads them
+    to keep startup memory usage low.
+    """
+    logger.info("--- Warming up AI models (pre-compile and unload) ---")
+    loop = asyncio.get_running_loop()
+
+    # --- ResNet for Scene Detection ---
+    if config.get('VIDEO_GPU_CONCURRENCY', 0) > 0:
+        from src.media.HelperMedia import _get_resnet_model, unload_resnet_model
+        logger.info("Warming up ResNet (compiling)...")
+        await loop.run_in_executor(None, _get_resnet_model)
+        logger.info("Unloading ResNet post-warmup.")
+        await loop.run_in_executor(None, unload_resnet_model)
+
+    # --- Tagger for Image/Video Tagging ---
+    if config.get('AUTOMATICALLY_TAG_IMG') or config.get('AUTOMATICALLY_TAG_VIDEOS'):
+        from ImageTagger import get_tagger
+        model_name = config['MODEL_TAGGER']
+        logger.info(f"Warming up Tagger '{model_name}'...")
+        tagger = await get_tagger(model_name)
+        logger.info("Unloading Tagger post-warmup.")
+        tagger.unload()
+
+    # --- CLIP for Reverse Image Search ---
+    from ClipManager import get_clip_manager
+    clip_manager = get_clip_manager()
+    model_name = config['MODEL_REVERSE_IMAGE']
+    logger.info(f"Warming up CLIP model '{model_name}'...")
+    await clip_manager.load_or_get_model(model_name)
+    logger.info("Unloading CLIP post-warmup.")
+    await clip_manager.unload()
+    logger.info("--- AI model warmup complete ---")
+
+
+async def periodic_background_tasks():
+    """A single background task for periodic maintenance like index building and model cleanup."""
+    task_logger = logging.getLogger("PeriodicTasks")
+    task_logger.setLevel(logging.INFO)
     shutdown_event = app_state["shutdown_event"]
 
     try:
-        rebuild_interval_minutes = int(app_state["config"].get("INDEX_REBUILD_INTERVAL_MINUTES", 15))
-        if rebuild_interval_minutes <= 0:
-            builder_logger.warning("Periodic index rebuilding is disabled (interval <= 0).")
-            return
+        config = app_state["config"]
+        rebuild_interval = int(config.get("INDEX_REBUILD_INTERVAL_MINUTES", 15)) * 60
+        idle_timeout = int(config.get("MODEL_IDLE_UNLOAD_SECONDS", 1800))
+        cleanup_interval = 60  # Check every minute
 
-        rebuild_interval_seconds = rebuild_interval_minutes * 60
-        builder_logger.info(f"FAISS index will be rebuilt every {rebuild_interval_minutes} minutes.")
+        # Configure ClipManager's self-managed idle cleanup
+        from ClipManager import get_clip_manager
+        await get_clip_manager().configure_idle_cleanup(idle_timeout)
+
+        task_logger.info(f"Periodic tasks started. Index rebuild: {rebuild_interval}s, Model cleanup: {cleanup_interval}s, Idle timeout: {idle_timeout}s.")
+        last_rebuild_time = asyncio.get_running_loop().time()
 
         while not shutdown_event.is_set():
             try:
-                # Wait for the interval, checking for shutdown every 5 seconds
-                await asyncio.wait_for(shutdown_event.wait(), timeout=rebuild_interval_seconds)
+                await asyncio.wait_for(shutdown_event.wait(), timeout=cleanup_interval)
             except asyncio.TimeoutError:
-                builder_logger.info("Triggering periodic FAISS index rebuild...")
-                try:
-                    await build_faiss_index()
-                    builder_logger.info("Periodic FAISS index rebuild completed successfully.")
-                except Exception as e:
-                    builder_logger.error(f"Periodic FAISS index build failed: {e}", exc_info=True)
+                
+                # --- Model Cleanup ---
+                if idle_timeout > 0:
+                    from src.media.HelperMedia import check_and_unload_idle_resnet
+                    from ImageTagger import check_and_unload_idle_taggers
+                    task_logger.debug("Running periodic model cleanup...")
+                    await asyncio.to_thread(check_and_unload_idle_resnet, idle_timeout)
+                    await check_and_unload_idle_taggers(idle_timeout)
+
+                # --- Index Rebuild ---
+                if rebuild_interval > 0 and (asyncio.get_running_loop().time() - last_rebuild_time) > rebuild_interval:
+                    task_logger.info("Triggering periodic FAISS index rebuild...")
+                    try:
+                        await build_faiss_index()
+                        task_logger.info("Periodic FAISS index rebuild completed successfully.")
+                        last_rebuild_time = asyncio.get_running_loop().time()
+                    except Exception as e:
+                        task_logger.error(f"Periodic FAISS index build failed: {e}", exc_info=True)
     except asyncio.CancelledError:
-        builder_logger.info("Periodic index builder task was cancelled.")
+        task_logger.info("Periodic background task was cancelled.")
     finally:
-        builder_logger.info("Periodic index builder has shut down.")
+        task_logger.info("Periodic background tasks have shut down.")
+
+
 
 
 async def startup_scanner_logic():
     logger.info("--- Media Scanner Initializing ---")
 
+    config_manager = get_config()
+    await warmup_and_unload_models(config_manager.data)
+
     executor = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) * 2)
     app_state["executor"] = executor
-    config_manager = get_config()
-
-    # Phase 1: Initial Configuration and Worker Setup
-    await update_application_state(config_manager, processing_queue, first_run=True)
+    await update_application_state(config_manager, first_run=True)
     config = app_state["config"]
     os.makedirs(config["FILESTORE_DIR"], exist_ok=True)
 
-    # Start the dispatcher and model cleanup tasks. They will wait for work.
     num_dispatchers = (os.cpu_count() or 4)
-    dispatchers = [asyncio.create_task(dispatcher_worker(f"D-{i+1}", processing_queue, executor)) for i in range(num_dispatchers)]
-    cleanup_task = asyncio.create_task(model_cleanup_task())
+    dispatchers = [asyncio.create_task(dispatcher_worker(f"D-{i+1}", app_state, app_state["intake_queue"], executor)) for i in range(num_dispatchers)]
 
-    # Phase 2: Initial Scan and Batch Processing
     if not config_manager.get('SKIP_SCAN_ON_START', '1'):
-        await initial_scan(processing_queue, config["WATCH_DIRS"])
+        scanner = app_state.get("scanner")
+        if scanner:
+            await scanner.initial_scan()
 
     logger.info("Waiting for all initial files to be dispatched...")
-    await processing_queue.join()
+    await app_state["intake_queue"].join()
     logger.info("All initial files have been dispatched to worker pools.")
 
     await task_registry.join_all()
     logger.info("All initial file processing is complete.")
 
-    # Phase 3: Initial FAISS Index Build
-    if not processing_queue.empty():
+    if not app_state["intake_queue"].empty():
          logger.warning("Intake queue is not empty after join, this is unexpected.")
 
     logger.info("Triggering initial FAISS index build...")
@@ -383,21 +257,21 @@ async def startup_scanner_logic():
     except Exception as e:
         logger.error(f"Initial FAISS index build failed: {e}", exc_info=True)
 
-    # Phase 4: Start Long-Running Services
     logger.info("Starting long-running services (file watcher, periodic index builder)...")
 
-    media_observer = app_state.get("media_observer")
-    if media_observer:
-        media_observer.start()
+    scanner = app_state.get("scanner")
+    if scanner:
+        scanner.start_watching()
 
-    index_builder_task = asyncio.create_task(periodic_index_builder())
+    periodic_tasks_handle = asyncio.create_task(periodic_background_tasks())
 
     loop = asyncio.get_running_loop()
     def reload_sync_callback():
         logger.info("Config file change detected. Scheduling state update...")
-        asyncio.run_coroutine_threadsafe(
-            update_application_state(config_manager, processing_queue), loop
+        asyncio.run_coroutine_threadsafe( 
+            update_application_state(config_manager), loop
         )
+
     config_handler = ConfigChangeHandler(file_paths=config_manager.paths, reload_callback=reload_sync_callback)
     config_observer = Observer()
     config_watch_dirs = {os.path.dirname(p) for p in config_manager.paths}
@@ -406,31 +280,45 @@ async def startup_scanner_logic():
     config_observer.start()
     logger.info(f"Watching for changes in: {config_manager.paths[0]}")
 
-    return {
-        "background_tasks": dispatchers + [cleanup_task],
-        "index_builder_task": index_builder_task,
+    app_state["service_handles"] = {
+        "background_tasks": dispatchers + [],
+        "periodic_tasks_handle": periodic_tasks_handle,
         "executor": executor,
         "config_observer": config_observer,
-        "intake_queue": processing_queue,
     }
+    return app_state
 
 
 async def shutdown_scanner_logic(state: dict):
     logger.info("\n--- Starting graceful shutdown of the scanner service ---")
 
-    if "shutdown_event" in app_state:
-        app_state["shutdown_event"].set()
+    app_state["shutdown_event"].set()
 
-    config_observer = state.get("config_observer")
-    media_observer = app_state.get("media_observer")
+    service_handles = state.get("service_handles", {})
+    config_observer = service_handles.get("config_observer")
     if config_observer:
-        config_observer.stop(); config_observer.join(timeout=2.0)
-    if media_observer:
-        media_observer.stop(); media_observer.join(timeout=2.0)
+        config_observer.stop()
+        # Run the blocking join in an executor to avoid blocking the event loop.
+        await asyncio.get_running_loop().run_in_executor(None, config_observer.join, 2.0)
+    
+    scanner = app_state.get("scanner")
+    if scanner:
+        # This method is now async and uses run_in_executor for its own join.
+        await scanner.stop_watching()
+
+    # --- Stop auxiliary background tasks ---
+    from ClipManager import get_clip_manager
+    from Searcher import _searcher_instance
+
+    logger.info("Stopping auxiliary background tasks (ClipManager, Searcher)...")
+    await get_clip_manager().stop_cleanup_task()
+    if _searcher_instance:
+        await _searcher_instance.shutdown()
+    # ---
 
     all_tasks = []
-    if state.get("background_tasks"): all_tasks.extend(state["background_tasks"])
-    if state.get("index_builder_task"): all_tasks.append(state["index_builder_task"])
+    if service_handles.get("background_tasks"): all_tasks.extend(service_handles["background_tasks"])
+    if service_handles.get("periodic_tasks_handle"): all_tasks.append(service_handles["periodic_tasks_handle"])
 
     if all_tasks:
         logger.info(f"Cancelling {len(all_tasks)} background tasks...")
@@ -444,10 +332,24 @@ async def shutdown_scanner_logic(state: dict):
     logger.info("Stopping all worker pools...")
     await task_registry.stop_all()
 
-    executor = state.get("executor")
+    executor = service_handles.get("executor")
     if executor:
         logger.info("Shutting down scanner thread pool executor...")
-        executor.shutdown(wait=True)
+        await asyncio.get_running_loop().run_in_executor(None, executor.shutdown, True)
+
+    # --- Explicitly shut down torch inductor workers to prevent atexit errors ---
+    try:
+        import torch._inductor.async_compile
+        logger.info("Shutting down PyTorch inductor compile workers...")
+        # This is a synchronous function, so run it in an executor.
+        await asyncio.get_running_loop().run_in_executor(None, torch._inductor.async_compile.shutdown_compile_workers)
+        logger.info("PyTorch inductor workers shut down.")
+    except ImportError:
+        # If torch inductor is not used or not found, this will fail, which is fine.
+        logger.debug("PyTorch inductor module not found, skipping its shutdown.")
+        pass
+    except Exception as e:
+        logger.error(f"Error shutting down PyTorch inductor workers: {e}")
 
     logger.info("--- Scanner service shutdown complete ---")
 

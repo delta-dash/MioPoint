@@ -7,24 +7,33 @@ from aiosqlite import Connection
 from src.db_utils import get_db_connection
 from src.models import UserProfile
 from src.roles.errors import PermissionDeniedError
+from src.roles.permissions import Permission
+from src.roles.rbac_manager import require_permission_from_profile
 from src.users.auth_dependency import get_current_active_user
-from src.reactions.ReactionService import (
-    add_reaction_to_file_securely, 
-    get_all_available_reactions, 
-    get_files_with_reaction_by_user_securely, 
-    remove_reaction_from_file_securely
+from src.reactions.HelperReactions import (
+    add_reaction_to_instance,
+    get_available_reactions,
+    get_instances_with_reaction_by_user,
+    remove_reaction_from_instance,
+    get_reactions_for_instance,
 )
 import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
-class ReactionRequest(BaseModel):
-    """Request body for adding or removing a reaction."""
-    file_id: int = Field(..., gt=0, description="The unique ID of the file.")
-    reaction_name: str = Field(..., min_length=1, description="The programmatic name of the reaction (e.g., 'like').")
+class ReactionSummaryResponse(BaseModel):
+    id: int
+    name: str
+    label: str
+    emoji: Optional[str] = None
+    image_path: Optional[str] = None
+    count: int
+    reacted_by_user: bool
+
 
 class ReactionInfo(BaseModel):
     """Defines the structure of an available reaction."""
+    id: int
     name: str
     label: str
     emoji: Optional[str]
@@ -34,8 +43,8 @@ class ReactionInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# A generic file model for responses
-class FileInfo(BaseModel):
+# A generic instance model for responses
+class InstanceInfo(BaseModel):
     id: int
     file_name: str
     file_type: str
@@ -45,12 +54,12 @@ class FileInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class PaginatedFileResponse(BaseModel):
-    """Standard paginated response structure for a list of files."""
+class PaginatedInstanceResponse(BaseModel):
+    """Standard paginated response structure for a list of file instances."""
     total: int
     page: int
     page_size: int
-    items: List[FileInfo]
+    items: List[InstanceInfo]
 
 router = APIRouter(prefix='/api',tags=["Reactions"])
 logger = logging.getLogger("ReactionRoutes")
@@ -60,86 +69,87 @@ logger.setLevel(logging.DEBUG)
 @router.get(
     "/reactions/available",
     response_model=List[ReactionInfo],
-    summary="Get All Available Reactions",
-    description="Fetches a list of all active reactions that users can apply to files (e.g., like, favorite)."
+    summary="Get Available Reactions",
+    description="Fetches a list of all active reactions that users can apply to file instances (e.g., like, favorite)."
 )
 async def get_available_reactions_route(conn: Connection = Depends(get_db_connection)):
     """
     Provides a list of all globally available and active reactions.
     This endpoint is public and does not require special permissions.
     """
-    # Service function is now async
-    return await get_all_available_reactions(conn=conn)
+    # Call helper function directly
+    return await get_available_reactions(conn=conn)
 
 
 @router.post(
-    "/reactions",
+    "/instance/{instance_id}/reactions/{reaction_id}",
+    response_model=List[ReactionSummaryResponse],
     status_code=status.HTTP_201_CREATED,
-    summary="Add a Reaction to a File",
-    description="Adds a reaction from the current user to a specified file. Requires 'user:react' permission."
+    summary="Add a Reaction to a File Instance",
+    description="Adds a reaction from the current user to a specified file instance. Requires 'reaction:add' permission."
 )
+@require_permission_from_profile(Permission.REACTION_ADD)
 async def add_reaction_route(
-    payload: ReactionRequest,
+    instance_id: int,
+    reaction_id: int,
     current_user: UserProfile = Depends(get_current_active_user),
     conn: Connection = Depends(get_db_connection)
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
-    Applies a reaction from the authenticated user to a given file.
+    Applies a reaction from the authenticated user to a given file instance.
     """
     try:
-        # Service function is now async and uses conn
-        success = await add_reaction_to_file_securely(
+        success = await add_reaction_to_instance(
             user_id=current_user.id,
-            file_id=payload.file_id,
-            reaction_name=payload.reaction_name,
+            instance_id=instance_id,
+            reaction_id=reaction_id,
             conn=conn
         )
-        if success:
-            return {"status": "success", "detail": "Reaction added."}
-        else:
-            # The reaction might already exist, which isn't an error.
-            raise HTTPException(
-                status_code=status.HTTP_200_OK,
-                detail="Reaction already exists or file/reaction not found."
-            )
+        if not success:
+            # This can happen if the reaction already exists (INSERT OR IGNORE), which is not an error.
+            # We proceed to return the current state.
+            pass
+        
+        # On success or if it already exists, return the updated list of reactions for the instance.
+        return await get_reactions_for_instance(instance_id, current_user.id, conn)
+
     except PermissionDeniedError as e:
         logger.warning(f"Permission denied for user {current_user.id}: {e}")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except aiosqlite.IntegrityError:
+        # This can happen if instance_id or reaction_id is invalid and violates a FK constraint.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance or reaction not found.")
     except Exception as e:
         logger.error(f"Error adding reaction for user {current_user.id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred.")
 
 
 @router.delete(
-    "/reactions",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Remove a Reaction from a File",
-    description="Removes a reaction from the current user on a specified file. Requires 'user:react' permission."
+    "/instance/{instance_id}/reactions/{reaction_id}",
+    response_model=List[ReactionSummaryResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Remove a Reaction from a File Instance",
+    description="Removes a reaction from the current user on a specified file instance. Requires 'reaction:add' permission."
 )
+@require_permission_from_profile(Permission.REACTION_ADD)
 async def remove_reaction_route(
-    payload: ReactionRequest,
+    instance_id: int,
+    reaction_id: int,
     current_user: UserProfile = Depends(get_current_active_user),
     conn: Connection = Depends(get_db_connection)
 ):
     """
-    Removes a specific reaction applied by the authenticated user from a file.
+    Removes a specific reaction applied by the authenticated user from a file instance.
     """
     try:
-        # Service function is now async and uses conn
-        success = await remove_reaction_from_file_securely(
+        await remove_reaction_from_instance(
             user_id=current_user.id,
-            file_id=payload.file_id,
-            reaction_name=payload.reaction_name,
+            instance_id=instance_id,
+            reaction_id=reaction_id,
             conn=conn
         )
-        if not success:
-            # If the service returns false, the reaction didn't exist to be removed.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Reaction not found for this user and file."
-            )
-        # On success, a 204 No Content response is sent automatically.
-        return
+        # Always return the current state of reactions for the instance.
+        return await get_reactions_for_instance(instance_id, current_user.id, conn)
     except PermissionDeniedError as e:
         logger.warning(f"Permission denied for user {current_user.id}: {e}")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
@@ -149,26 +159,26 @@ async def remove_reaction_route(
 
 
 @router.get(
-    "/reactions/my-files/{reaction_name}",
-    response_model=PaginatedFileResponse,
-    summary="Get My Files with a Specific Reaction",
-    description="Retrieves a paginated list of files that the current user has marked with a specific reaction. Requires 'user:view_reactions' permission."
+    "/reactions/my-instances/{reaction_id}",
+    response_model=PaginatedInstanceResponse,
+    summary="Get My Instances with a Specific Reaction",
+    description="Retrieves a paginated list of file instances that the current user has marked with a specific reaction. Requires 'file:view' permission."
 )
-async def get_my_files_with_reaction_route(
-    reaction_name: str,
+@require_permission_from_profile(Permission.FILE_VIEW)
+async def get_my_instances_with_reaction_route(
+    reaction_id: int,
     current_user: UserProfile = Depends(get_current_active_user),
     conn: Connection = Depends(get_db_connection),
     page: int = Query(1, ge=1, description="Page number to retrieve."),
     page_size: int = Query(24, ge=1, le=100, description="Number of items per page.")
 ):
     """
-    Fetches files the authenticated user has reacted to.
+    Fetches file instances the authenticated user has reacted to.
     """
     try:
-        # Service function is now async and uses conn
-        return await get_files_with_reaction_by_user_securely(
+        return await get_instances_with_reaction_by_user(
             user_id=current_user.id,
-            reaction_name=reaction_name,
+            reaction_id=reaction_id,
             page=page,
             page_size=page_size,
             conn=conn

@@ -10,6 +10,27 @@ import logging
 logger = logging.getLogger("UtilsFile")
 logger.setLevel(logging.DEBUG)
 
+LEVEL_COLORS = {
+    "DEBUG": "\033[36m",    # Cyan
+    "INFO": "\033[32m",     # Green
+    "WARNING": "\033[33m",  # Yellow
+    "ERROR": "\033[31m",    # Red
+    "CRITICAL": "\033[41m", # Red background
+}
+RESET = "\033[0m"
+
+class ColorFormatter(logging.Formatter):
+    def format(self, record):
+        level_color = LEVEL_COLORS.get(record.levelname, "")
+        record.levelname = f"{level_color}{record.levelname}{RESET}"
+        record.name = f"{LEVEL_COLORS['WARNING']}{record.name}{RESET}"
+        return f"{record.levelname}\t{record.name}\t{record.getMessage()}"
+    
+logging_handler = logging.StreamHandler()
+logging_handler.setLevel(logging.DEBUG)
+logging_handler.setFormatter(ColorFormatter())
+
+
 def get_original_filename(path: str) -> str:
     """
     Extracts the original filename from a path that is expected to be in the

@@ -19,6 +19,7 @@ To manage the key manually, run this file from your terminal:
 import keyring
 import secrets
 import sys
+import logging
 from keyring.errors import NoKeyringError
 
 # ==============================================================================
@@ -39,6 +40,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 # Set a very long refresh token lifespan (e.g., 100 years).
 REFRESH_TOKEN_EXPIRE_DAYS: int = 36500
 
+# Get a logger for this module
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # --- KEYRING HELPER FUNCTIONS ---
@@ -56,14 +59,13 @@ def store_jwt_secret(secret_key: str):
     """
     try:
         keyring.set_password(SERVICE_NAME, JWT_SECRET_USERNAME, secret_key)
-        print(f"✅ Secret key successfully stored for service '{SERVICE_NAME}'.")
+        logger.info(f"Secret key successfully stored in system keyring for service '{SERVICE_NAME}'.")
     except Exception as e:
-        print(
-            "❌ CRITICAL ERROR: Could not store secret in keyring.",
-            "Your system may not have a supported backend (e.g., dbus-launch).",
-            f"   Original error: {e}",
-            sep="\n",
-            file=sys.stderr
+        logger.critical(
+            "Could not store secret in keyring. "
+            "Your system may not have a supported backend (e.g., dbus-launch). "
+            f"Original error: {e}",
+            exc_info=True
         )
         sys.exit(1)
 
@@ -81,12 +83,11 @@ def retrieve_jwt_secret() -> str | None:
     try:
         return keyring.get_password(SERVICE_NAME, JWT_SECRET_USERNAME)
     except (NoKeyringError, Exception) as e:
-        print(
-            "❌ CRITICAL ERROR: Could not retrieve secret from keyring.",
-            "Your system may not have a supported backend.",
-            f"   Original error: {e}",
-            sep="\n",
-            file=sys.stderr
+        logger.critical(
+            "Could not retrieve secret from keyring. "
+            "Your system may not have a supported backend. "
+            f"Original error: {e}",
+            exc_info=True
         )
         sys.exit(1)
 
@@ -106,13 +107,13 @@ def _initialize_secret() -> str:
     secret = retrieve_jwt_secret()
 
     if secret:
-        print(f"✅ JWT secret key found and loaded from system keyring for '{SERVICE_NAME}'.")
+        logger.info(f"✅ JWT secret key found and loaded from system keyring for '{SERVICE_NAME}'.")
         return secret
     else:
-        print(f"ℹ️ No secret key found for '{SERVICE_NAME}'. Generating a new one...")
+        logger.warning(f"ℹ️ No secret key found for '{SERVICE_NAME}'. Generating a new one...")
         new_secret = secrets.token_hex(32)
         store_jwt_secret(new_secret)
-        print("🔑 New secret key has been generated and securely stored.")
+        logger.info("🔑 New secret key has been generated and securely stored.")
         return new_secret
 
 # --- LOAD OR CREATE THE SECRET KEY ON MODULE IMPORT ---

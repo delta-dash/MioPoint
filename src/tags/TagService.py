@@ -102,17 +102,17 @@ async def remove_tag_securely(
 @require_permission(permission='tag:edit', caller_id_arg='user_id')
 async def assign_tags_to_file_securely(
     user_id: int, 
-    file_id: int, 
+    instance_id: int, 
     tags: List[Union[int, str]], 
     tag_type: str, 
     conn: aiosqlite.Connection
 ) -> bool:
     """
-    Securely and asynchronously assigns tags to a file after verifying user permission.
+    Securely and asynchronously assigns tags to a file's content after verifying user permission.
     """
-    logger.info(f"User {user_id} is assigning tags to file {file_id}.")
+    logger.info(f"User {user_id} is assigning tags to content of instance {instance_id}.")
     return await assign_tags_to_file(
-        file_id=file_id,
+        instance_id=instance_id,
         tags=tags,
         tag_type=tag_type,
         conn=conn
@@ -121,17 +121,17 @@ async def assign_tags_to_file_securely(
 @require_permission(permission='tag:edit', caller_id_arg='user_id')
 async def unassign_tags_from_file_securely(
     user_id: int, 
-    file_id: int, 
+    instance_id: int, 
     tags: List[Union[int, str]], 
     tag_type: str, 
     conn: aiosqlite.Connection
 ) -> bool:
     """
-    Securely and asynchronously unassigns tags from a file after verifying user permission.
+    Securely and asynchronously unassigns tags from a file's content after verifying user permission.
     """
-    logger.info(f"User {user_id} is unassigning tags from file {file_id}.")
+    logger.info(f"User {user_id} is unassigning tags from content of instance {instance_id}.")
     return await unassign_tags_from_file(
-        file_id=file_id,
+        instance_id=instance_id,
         tags=tags,
         tag_type=tag_type,
         conn=conn

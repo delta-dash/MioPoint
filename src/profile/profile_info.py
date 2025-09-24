@@ -8,7 +8,7 @@ from src.db_utils import execute_db_query
 from src.models import UserProfile
 
 logger = logging.getLogger("ConfigRoutes")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 
@@ -137,7 +137,7 @@ async def get_user_profile_with_details_by_id(conn: aiosqlite.Connection, user_i
     user_profile['roles'] = list(roles_map.values())
     user_profile['permissions'] = list(permissions_map.values())
     
-    logger.debug(f"Constructed user_profile: {user_profile}")
+    #logger.debug(f"Constructed user_profile: {user_profile}")
     
     return user_profile
 

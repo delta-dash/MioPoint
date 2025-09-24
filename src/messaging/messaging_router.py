@@ -17,9 +17,11 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 # --- INTEGRATION: Import from the new messaging_service ---
+from src.media.HelperMedia import get_instance_details
 from src.messaging.messaging_service import (
     create_direct_message_thread,
     create_group_thread,
@@ -226,7 +228,7 @@ async def leave_thread_route(
     """
     Allows a user to leave a thread.
     """
-    success = await leave_thread(user_id=current_user.id, thread_id=thread_id)
+    success, _ = await leave_thread(user_id=current_user.id, thread_id=thread_id)
     if not success:
         raise HTTPException(status_code=400, detail="Could not leave thread.")
     return
@@ -353,43 +355,84 @@ async def delete_a_post_route(
 # --- Watch Party Routes ---
 # ==============================================================================
 
-@router.get("/watch-parties/for-file/{file_id}", response_model=List[WatchPartyResponse])
-async def list_watch_parties_for_file_route(file_id: int, current_user: UserProfile = Depends(get_current_active_user)):
+@router.get("/watch-parties/for-instance/{instance_id}", response_model=List[WatchPartyResponse])
+async def list_watch_parties_for_instance_route(instance_id: int, current_user: UserProfile = Depends(get_current_active_user)):
     """
-    Retrieves a list of all active watch parties for a specific file.
+    Retrieves a list of all active watch parties for a specific file instance.
     """
-    # Assuming FILE_VIEW permission is required to see watch parties for a file.
-    # This check can be added here or assumed to be handled by the client-side flow.
-    return await list_watch_parties_for_file(file_id=file_id)
+    # A watch party is tied to the content, not the specific instance.
+    # First, get the content_id for the given instance_id.
+    instance_details = await get_instance_details(instance_id, user_id=current_user.id)
+    if not instance_details:
+        # If the user can't see the instance, they can't see its watch parties.
+        # Return an empty list, as this is a GET request.
+        return []
+    content_id = instance_details['content_id']
+    return await list_watch_parties_for_file(file_id=content_id)
 
-@router.post("/watch-parties/for-file/{file_id}", response_model=WatchPartyResponse, status_code=status.HTTP_201_CREATED)
-async def create_watch_party_route(
-    file_id: int,
+@router.post("/watch-parties/for-instance/{instance_id}", response_model=WatchPartyResponse, status_code=status.HTTP_201_CREATED)
+async def create_watch_party_for_instance_route(
+    instance_id: int,
     request: CreateWatchPartyRequest,
     current_user: UserProfile = Depends(get_current_active_user)
 ):
     """
-    Creates a new watch party chat thread for a specific file and broadcasts
-    an update to all clients viewing that file's page.
+    Creates a new watch party chat thread for a specific file instance and broadcasts
+    an update to all clients viewing that instance's page.
     """
     try:
-        # 1. Create the party in the database (this is unchanged)
+        # A watch party is tied to the content, not the specific instance.
+        # First, get the content_id for the given instance_id.
+        instance_details = await get_instance_details(instance_id, user_id=current_user.id)
+        if not instance_details:
+            raise HTTPException(status_code=404, detail="File instance not found or access denied.")
+        content_id = instance_details['content_id']
+
+        # 1. Create the party in the database
         new_party_thread = await create_watch_party_thread(
             creator_id=current_user.id,
-            file_id=file_id,
+            file_id=content_id, # Pass the correct content_id to the service
             name=request.name
         )
         if not new_party_thread:
             raise HTTPException(status_code=403, detail="Failed to create watch party. You may lack the required permissions.")
         
-        # --- FIX: STEP 3 - Broadcast the update via WebSocket ---
-        # The room name must match the one the client subscribes to.
-        observation_room = f"file-viewers:{file_id}"
-        update_message = {"type": "party_list_updated", "payload": {"fileId": file_id}}
+        # --- WEBSOCKET STATE UPDATE ---
+        # Now that the party is created, join the creator's websockets to the room
+        # and notify them that they are in the party.
+        thread_id = new_party_thread['id']
+        user_id = current_user.id
         
-        # Use the manager instance to broadcast to the specific room.
+        # Find all active websockets for the creator
+        user_websockets = manager.active_connections.get(user_id, [])
+        for ws in user_websockets:
+            await manager.join_room(ws, thread_id)
+
+        # Send a success message to all of the creator's connections so their UI updates.
+        join_success_message = {
+            "type": "joined_watch_party_success",
+            "payload": {
+                "thread_id": thread_id,
+                "file_id": instance_id, # The instance_id from the route
+                "is_owner": True
+            }
+        }
+        await manager.send_personal_message_to_user(user_id, join_success_message)
+
+        # --- BROADCAST UPDATE ---
+        # Fetch the complete, updated list of parties for this content.
+        all_parties_for_content = await list_watch_parties_for_file(file_id=content_id)
+
+        observation_room = f"instance-viewers:{instance_id}"
+        # Send the full list directly to clients, avoiding a refetch.
+        update_message = {
+            "type": "party_list_updated",
+            "payload": {
+                "fileId": instance_id,
+                "parties": jsonable_encoder(all_parties_for_content)
+            }
+        }
         await manager.broadcast_to_room(observation_room, update_message)
-        # --- END OF FIX ---
 
         # 3. Return the response to the creator (this is unchanged)
         # We need to manually construct the response because create_watch_party_thread returns a dict
@@ -402,7 +445,7 @@ async def create_watch_party_route(
             member_count=1  # The creator is the first member
         )
     except Exception as e:
-        logger.error(f"Error creating watch party for file {file_id} by user {current_user.id}: {e}", exc_info=True)
+        logger.error(f"Error creating watch party for instance {instance_id} by user {current_user.id}: {e}", exc_info=True)
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail="An internal error occurred.")
@@ -412,9 +455,18 @@ async def create_watch_party_route(
 async def join_watch_party_route(invite_code: str, current_user: UserProfile = Depends(get_current_active_user)):
     """
     Allows a user to join an existing watch party using an invite code.
+    If the user is in another party, they will be moved.
     """
-    thread_id = await join_watch_party_thread(user_id=current_user.id, invite_code=invite_code)
-    if thread_id is None:
+    join_result = await join_watch_party_thread(user_id=current_user.id, invite_code=invite_code)
+    if not join_result:
         raise HTTPException(status_code=404, detail="Invalid or expired invite code.")
     
+    # The HTTP endpoint doesn't handle websocket notifications for the old party
+    # that the user might have left. This is a limitation of using HTTP for this
+    # action. The primary path is via WebSocket, which handles all notifications.
+    # This endpoint ensures the DB state is correct.
+    thread_id = join_result.get("thread_id")
+    if not thread_id:
+        raise HTTPException(status_code=500, detail="Failed to join party.")
+
     return JoinWatchPartyResponse(thread_id=thread_id)

@@ -2,3 +2,6 @@ __pycache__
 config
 filesstore
 models
+.python-version
+test.py
+/static

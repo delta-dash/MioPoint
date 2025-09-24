@@ -11,14 +11,15 @@ from src.users.auth import TokenRevokedError, authenticate_user_from_token, get_
 logger = logging.getLogger("Auth")
 logger.setLevel(logging.DEBUG)
 
-async def get_current_user_or_guest(
+async def get_current_user_from_token(
     token: Optional[str] = Depends(get_token_from_header_or_cookie)
 ) -> UserProfile:
     """
     Primary dependency to get a user identity from a request.
     It authenticates from a token (header or cookie).
     If no valid token is found, it raises a 401 error.
-    This should be used by endpoints that can be accessed by guests.
+    This function authenticates ANY user, including guests, if they have a valid token.
+    It does NOT provision new guest users.
     """
     if token:
         try:
@@ -39,7 +40,7 @@ async def get_current_user_or_guest(
 
 # --- NEW: Strict Dependency for Authenticated Users ---
 async def get_current_active_user(
-    current_user: UserProfile = Depends(get_current_user_or_guest)
+    current_user: UserProfile = Depends(get_current_user_from_token)
 ) -> UserProfile:
     """
     A stricter dependency for protected routes.

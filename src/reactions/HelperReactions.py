@@ -51,15 +51,16 @@ async def setup_reactions_database_async():
             """)
             
             # Junction table to link users, files, and reactions
+            # NOTE: This schema has been updated to reference file_instances instead of a legacy 'files' table.
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS user_file_reactions (
+                CREATE TABLE IF NOT EXISTS user_instance_reactions (
                     user_id INTEGER NOT NULL,
-                    file_id INTEGER NOT NULL,
+                    instance_id INTEGER NOT NULL,
                     reaction_id INTEGER NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, file_id, reaction_id),
+                    PRIMARY KEY (user_id, instance_id, reaction_id),
                     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
-                    FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+                    FOREIGN KEY (instance_id) REFERENCES file_instances (id) ON DELETE CASCADE,
                     FOREIGN KEY (reaction_id) REFERENCES reactions (id) ON DELETE CASCADE
                 );
             """)
@@ -104,81 +105,55 @@ async def populate_default_reactions_async(conn: aiosqlite.Connection):
 # ==============================================================================
 # --- INTERNAL HELPERS ---
 # ==============================================================================
-
-async def _get_reaction_id_by_name_async(conn: aiosqlite.Connection, reaction_name: str) -> Optional[int]:
-    """Internal async helper to get a reaction's ID from its programmatic name."""
-    query = "SELECT id FROM reactions WHERE name = ? AND is_active = 1"
-    result = await execute_db_query(conn, query, (reaction_name,), fetch_one=True)
-    return result['id'] if result else None
-
-
 # ==============================================================================
 # --- REACTION MANAGEMENT ---
 # ==============================================================================
 
-async def add_reaction_to_file(
-    user_id: int, 
-    file_id: int, 
-    reaction_name: str, 
-    conn: Optional[aiosqlite.Connection] = None
+async def add_reaction_to_instance(
+    user_id: int, instance_id: int, reaction_id: int, conn: Optional[aiosqlite.Connection] = None
 ) -> bool:
     """
-    Asynchronously adds a reaction from a user to a file.
+    Asynchronously adds a reaction from a user to a file instance.
 
     Args:
         user_id: ID of the user adding the reaction.
-        file_id: ID of the file being reacted to.
-        reaction_name: The programmatic name of the reaction (e.g., 'like').
+        instance_id: ID of the file instance being reacted to.
+        reaction_id: The ID of the reaction to add.
         conn: An optional aiosqlite connection for transactional operations.
 
     Returns:
         True if the reaction was added successfully, False otherwise.
     """
     async with AsyncDBContext(conn) as connection:
-        normalized_name = reaction_name.strip().lower()
-        if not normalized_name:
-            return False
-            
-        reaction_id = await _get_reaction_id_by_name_async(connection, normalized_name)
-        if reaction_id is None:
-            logger.warning(f"Reaction '{normalized_name}' is not a valid or active reaction type.")
-            return False
-        
         try:
-            query = "INSERT OR IGNORE INTO user_file_reactions (user_id, file_id, reaction_id) VALUES (?, ?, ?)"
-            rowcount = await execute_db_query(connection, query, (user_id, file_id, reaction_id))
+            query = "INSERT OR IGNORE INTO user_instance_reactions (user_id, instance_id, reaction_id) VALUES (?, ?, ?)"
+            rowcount = await execute_db_query(connection, query, (user_id, instance_id, reaction_id))
             return rowcount > 0
         except aiosqlite.IntegrityError:
-            logger.error(f"Could not add reaction due to integrity constraint. User {user_id} or File {file_id} may not exist.")
+            logger.error(
+                f"Could not add reaction due to integrity constraint. User {user_id}, Instance {instance_id}, or Reaction {reaction_id} may not exist."
+            )
             return False
 
 
-async def remove_reaction_from_file(
-    user_id: int, 
-    file_id: int, 
-    reaction_name: str, 
-    conn: Optional[aiosqlite.Connection] = None
+async def remove_reaction_from_instance(
+    user_id: int, instance_id: int, reaction_id: int, conn: Optional[aiosqlite.Connection] = None
 ) -> bool:
     """
-    Asynchronously removes a specific reaction from a user on a file.
+    Asynchronously removes a specific reaction from a user on a file instance.
 
     Args:
         user_id: ID of the user whose reaction is being removed.
-        file_id: ID of the file.
-        reaction_name: The programmatic name of the reaction to remove.
+        instance_id: ID of the file instance.
+        reaction_id: The ID of the reaction to remove.
         conn: An optional aiosqlite connection for transactional operations.
 
     Returns:
         True if a reaction was removed, False otherwise.
     """
     async with AsyncDBContext(conn) as connection:
-        normalized_name = reaction_name.strip().lower()
-        reaction_id = await _get_reaction_id_by_name_async(connection, normalized_name)
-        if reaction_id is None:
-            return False
-            
-        query = "DELETE FROM user_file_reactions WHERE user_id = ? AND file_id = ? AND reaction_id = ?"
-        rowcount = await execute_db_query(connection, query, (user_id, file_id, reaction_id))
+        query = "DELETE FROM user_instance_reactions WHERE user_id = ? AND instance_id = ? AND reaction_id = ?"
+        rowcount = await execute_db_query(connection, query, (user_id, instance_id, reaction_id))
         return rowcount > 0
 
 
@@ -186,43 +161,79 @@ async def remove_reaction_from_file(
 # --- QUERY FUNCTIONS ---
 # ==============================================================================
 
-async def get_files_with_reaction_by_user(
-    user_id: int, 
-    reaction_name: str, 
-    page: int = 1, 
-    page_size: int = 24, 
+async def get_reactions_for_instance(
+    instance_id: int,
+    user_id: int,
+    conn: Optional[aiosqlite.Connection] = None
+) -> List[Dict[str, Any]]:
+    """
+    Asynchronously retrieves a summary of reactions for a specific file instance.
+
+    For each available reaction, it provides the count and whether the current user has applied it.
+    """
+    async with AsyncDBContext(conn) as connection:
+        # This query gets all active reactions and LEFT JOINs the reactions for the specific instance.
+        # This ensures all reaction types are returned, even with a count of 0.
+        query = """
+            SELECT
+                r.id,
+                r.name,
+                r.label,
+                r.emoji,
+                r.image_path,
+                COUNT(uir.user_id) as count,
+                CAST(SUM(CASE WHEN uir.user_id = ? THEN 1 ELSE 0 END) > 0 AS INTEGER) as reacted_by_user
+            FROM reactions r
+            LEFT JOIN user_instance_reactions uir ON r.id = uir.reaction_id AND uir.instance_id = ?
+            WHERE r.is_active = 1
+            GROUP BY r.id
+            ORDER BY r.sort_order ASC, r.name ASC;
+        """
+        params = (user_id, instance_id)
+        rows = await execute_db_query(connection, query, params, fetch_all=True)
+
+        # Convert the integer 'reacted_by_user' to a boolean for the response model.
+        results = []
+        for row in rows:
+            row_dict = dict(row)
+            row_dict['reacted_by_user'] = bool(row_dict['reacted_by_user'])
+            results.append(row_dict)
+        return results
+
+
+async def get_instances_with_reaction_by_user(
+    user_id: int,
+    reaction_id: int,
+    page: int = 1,
+    page_size: int = 24,
     conn: Optional[aiosqlite.Connection] = None
 ) -> Dict[str, Any]:
     """
-    Asynchronously finds all files that a specific user has reacted to in a certain way.
+    Asynchronously finds all file instances that a specific user has reacted to in a certain way.
     
     Args:
         user_id: ID of the user.
-        reaction_name: The programmatic name of the reaction (e.g., 'favorite').
+        reaction_id: The ID of the reaction to filter by.
         page: The page number for pagination (1-indexed).
         page_size: The number of items per page.
         conn: An optional aiosqlite connection for transactional operations.
 
     Returns:
-        A dictionary with pagination info and a list of file data.
+        A dictionary with pagination info and a list of instance card data.
     """
     async with AsyncDBContext(conn) as connection:
         offset = (page - 1) * page_size
-        normalized_name = reaction_name.strip().lower()
-        
-        reaction_id = await _get_reaction_id_by_name_async(connection, normalized_name)
-        if reaction_id is None:
-            return {"total": 0, "page": page, "page_size": page_size, "items": []}
-        
-        count_query = "SELECT COUNT(file_id) FROM user_file_reactions WHERE user_id = ? AND reaction_id = ?"
+        count_query = "SELECT COUNT(instance_id) FROM user_instance_reactions WHERE user_id = ? AND reaction_id = ?"
         total_row = await execute_db_query(connection, count_query, (user_id, reaction_id), fetch_one=True)
         total_count = total_row[0] if total_row else 0
         
         items_query = """
-            SELECT f.id, f.file_name, f.file_type, f.is_encrypted, f.file_hash
-            FROM files f JOIN user_file_reactions ufr ON f.id = ufr.file_id
-            WHERE ufr.user_id = ? AND ufr.reaction_id = ?
-            ORDER BY ufr.created_at DESC LIMIT ? OFFSET ?
+            SELECT fi.id, fi.file_name, fc.file_type, fc.is_encrypted, fc.file_hash
+            FROM file_instances fi
+            JOIN file_content fc ON fi.content_id = fc.id
+            JOIN user_instance_reactions uir ON fi.id = uir.instance_id
+            WHERE uir.user_id = ? AND uir.reaction_id = ?
+            ORDER BY uir.created_at DESC LIMIT ? OFFSET ?
         """
         items_rows = await execute_db_query(connection, items_query, (user_id, reaction_id, page_size, offset), fetch_all=True)
         items = [dict(row) for row in items_rows]
@@ -242,7 +253,7 @@ async def get_available_reactions(conn: Optional[aiosqlite.Connection] = None) -
 
     async with AsyncDBContext(conn) as connection:
         query = (
-            "SELECT name, label, emoji, image_path, description FROM reactions "
+            "SELECT id, name, label, emoji, image_path, description FROM reactions "
             "WHERE is_active = 1 ORDER BY sort_order ASC, name ASC"
         )
         reactions_rows = await execute_db_query(connection, query, fetch_all=True)

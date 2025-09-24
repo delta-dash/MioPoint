@@ -76,24 +76,19 @@ async def execute_db_query(
     fetch_all: bool = False,
     return_last_row_id: bool = False
 ) -> Any:
-    """
-    Executes an async database query using a provided aiosqlite connection.
-    Commit/rollback is handled by the context managing the connection.
-    """
-    try:
-        logger.debug(f"Executing query: {query} with params: {params}")
-        async with conn.cursor() as cursor:
-            await cursor.execute(query, params)
+    
+    
+    logger.debug(f"Executing query: {query} with params: {params}")
+    async with conn.cursor() as cursor:
+        await cursor.execute(query, params)
 
-            if return_last_row_id:
-                return cursor.lastrowid
-            elif fetch_one:
-                return await cursor.fetchone()
-            elif fetch_all:
-                return await cursor.fetchall()
-            else:
-                return cursor.rowcount  # For INSERT/UPDATE/DELETE
+        if return_last_row_id:
+            return cursor.lastrowid
+        elif fetch_one:
+            return await cursor.fetchone()
+        elif fetch_all:
+            return await cursor.fetchall()
+        else:
+            return cursor.rowcount  # For INSERT/UPDATE/DELETE
 
-    except Exception as e:
-        logger.error(f"Error executing query '{query}': {e}", exc_info=True)
-        raise e
+    

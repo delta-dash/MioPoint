@@ -19,7 +19,7 @@ from src.db_utils import get_db_connection
 from src.models import Token, User, UserCreate, UserProfile
 from src.profile.profile_info import get_current_active_user_profile, get_user_profile_with_details_by_id
 from src.roles.errors import PermissionDeniedError
-from src.users.auth_dependency import get_current_active_user, get_current_user_or_guest
+from src.users.auth_dependency import get_current_active_user
 from src.users.service import get_all_user_profiles_with_details_securely, get_user_data_by_id_securely, set_user_active_status_securely
 from src.users.user_manager import create_user, get_or_create_guest_user, get_user_by_id, verify_user
 
@@ -60,7 +60,7 @@ auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 # File: tools/users/routes.py
 
-@auth_router.post("/session/init", response_model=UserProfile, summary="Initialize a user or guest session")
+@auth_router.post("/session/init", response_model=UserProfile, summary="Initialize a user session")
 async def initialize_session(
     request: Request,
     response: Response,
@@ -70,43 +70,20 @@ async def initialize_session(
 ):
     """
     The primary endpoint for a client app to initialize its session.
-    1. If a valid token exists, it returns the current user's profile.
-    2. If no valid token exists, it provisions a new guest session, sets the auth cookie,
-       and returns the new guest profile.
+    If a valid token exists, it returns the current user's profile.
+    If no valid token exists, it raises a 401 error, signaling the client to show a login page.
     """
     if current_user:
+        if not current_user.is_active:
+             raise HTTPException(status_code=403, detail="User is inactive.")
         logger.info(f"Session initialized for existing user: {current_user.username}")
         return current_user
 
-    # No valid user, so let's provision a guest.
-    logger.info("No valid session found. Provisioning new guest session.")
-    guest_result = await get_or_create_guest_user(request.client.host, conn)
-    if not guest_result:
-        raise HTTPException(status_code=500, detail="Could not create guest identity.")
-
-    guest_data, _ = guest_result
-    full_guest_profile_data = await get_user_profile_with_details_by_id(conn, guest_data['id'])
-    if not full_guest_profile_data:
-        raise HTTPException(status_code=500, detail="Could not retrieve guest profile.")
-    
-    guest_profile = UserProfile(**full_guest_profile_data)
-
-    # Create and set the cookie for the new guest session
-    expires = timedelta(days=90)
-    guest_token = create_access_token(
-        data={"sub": str(guest_profile.id)},
-        expires_delta=expires
+    # No valid user, so signal to the client that authentication is required.
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="No active session found.",
     )
-    response.set_cookie(
-        key=AUTH_COOKIE_NAME, value=guest_token,
-        httponly=True, samesite="lax", secure=IS_PRODUCTION,
-        max_age=int(expires.total_seconds())
-    )
-    
-    # Mark that we handled the cookie to prevent middleware from interfering
-    request.state.auth_cookie_was_set = True
-
-    return guest_profile
 
 @auth_router.post("/token", response_model=Token, dependencies=[Depends(rate_limiter_dependency(times=5, seconds=60))])
 async def login_for_access_token(  request: Request,
@@ -310,15 +287,11 @@ async def register_user(  request: Request,
     except aiosqlite.IntegrityError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already registered")
     
-@auth_router.get("/me", response_model=UserProfile, summary="Get current user's profile or guest identity")
+@auth_router.get("/me", response_model=UserProfile, summary="Get current user's profile")
 async def read_users_me(
-    current_user: UserProfile = Depends(get_current_user_or_guest)
+    current_user: UserProfile = Depends(get_current_active_user)
 ):
-    """
-    Returns the profile data for the currently logged-in user.
-    Note: The underlying dependencies like 'get_current_active_user_profile'
-    must also be updated to use the async DB connection.
-    """
+    """Returns the profile data for the currently logged-in user."""
     return current_user
 
 

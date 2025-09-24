@@ -14,7 +14,7 @@ async def handle_subscribe_to_file(websocket: WebSocket, payload: dict, **kwargs
         return
 
     # Create a unique, descriptive room name
-    room_name = f"file-viewers:{file_id}"
+    room_name = f"instance-viewers:{file_id}"
     
     # The manager's generic join_room works perfectly here.
     # It automatically handles leaving the previous room (whether it was another
@@ -27,7 +27,7 @@ async def handle_unsubscribe_from_file(websocket: WebSocket, payload: dict, **kw
     if not file_id:
         return
 
-    room_name = f"file-viewers:{file_id}"
+    room_name = f"instance-viewers:{file_id}"
     current_room = manager.get_rooms_for_websocket(websocket)
 
     # Only leave the room if they are actually in the one they claim to be leaving.

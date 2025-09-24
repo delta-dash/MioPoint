@@ -36,14 +36,14 @@ async def find_scenes_with_tags(video_path: str, tags: list[str]) -> list[dict]:
     # with an un-nested version of its own tags column to search for individual tags directly.
     query = f"""
         SELECT DISTINCT s.start_timecode, s.end_timecode
-        FROM files f
-        JOIN scenes s ON f.id = s.file_id
-        JOIN json_each(s.tags) j ON 1=1
-        WHERE f.file_name = ? AND j.value IN ({placeholders})
+        FROM file_instances fi
+        JOIN scenes s ON fi.content_id = s.content_id
+        JOIN scene_tags st ON s.id = st.scene_id
+        JOIN tags t ON st.tag_id = t.id
+        WHERE fi.stored_path = ? AND t.name IN ({placeholders})
         ORDER BY s.start_timecode
     """
 
-    # The parameters must include the video path first, followed by all the tags
     params = (video_path, *tags)
 
     # Use the new async context manager and execution function

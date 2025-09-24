@@ -14,11 +14,14 @@ class WebSocketConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, List[WebSocket]] = {}
         self.user_data_map: Dict[WebSocket, Dict[str, Any]] = {}
+        self.pending_leave_tasks: Dict[int, asyncio.Task] = {}
         
-        # --- Multi-Room Management ---
-        # Maps a room_id to a list of WebSockets in that room.
-        self.rooms: Dict[Union[int, str], List[WebSocket]] = {}
-        # CHANGED: Maps a WebSocket to a SET of room_ids it's in.
+        # --- Party & Observation Room Management ---
+        # A party room ID is the integer thread_id.
+        self.party_rooms: Dict[int, List[WebSocket]] = {}
+        # An observation room ID is a string like 'instance-viewers:123'.
+        self.observation_rooms: Dict[str, List[WebSocket]] = {}
+        # Maps a WebSocket to a SET of room_ids it's in.
         self.socket_to_rooms: Dict[WebSocket, Set[Union[int, str]]] = {}
         
     def is_in_room(self, websocket: WebSocket, room_id: Union[int, str]) -> bool:
@@ -28,10 +31,10 @@ class WebSocketConnectionManager:
             return False
         return room_id in user_rooms
     
-    # ... (get_users_in_room and connect methods are unchanged) ...
     def get_users_in_room(self, room_id: Union[int, str]) -> List[dict]:
         users = []
-        sockets_in_room = self.rooms.get(room_id, [])
+        sockets_in_room = self.party_rooms.get(room_id, []) if isinstance(room_id, int) else self.observation_rooms.get(room_id, [])
+
         for websocket in sockets_in_room:
             user_data = self.user_data_map.get(websocket)
             if user_data:
@@ -47,6 +50,13 @@ class WebSocketConnectionManager:
             logger.error("Attempted to connect WebSocket without a user_id.")
             return
 
+        # --- NEW: Cancel any pending leave task for this user ---
+        # This handles the case where a user reconnects (e.g. page refresh)
+        # before the grace period for leaving a party has expired.
+        if user_id in self.pending_leave_tasks:
+            pending_task = self.pending_leave_tasks.pop(user_id)
+            pending_task.cancel()
+            logger.info(f"User '{user_data.get('username')}' reconnected. Cancelling pending party leave.")
         if user_id not in self.active_connections:
             self.active_connections[user_id] = []
         self.active_connections[user_id].append(websocket)
@@ -76,12 +86,17 @@ class WebSocketConnectionManager:
     # --- Room Management Methods ---
 
     async def join_room(self, websocket: WebSocket, room_id: Union[int, str]):
-        # CHANGED: No longer leaves previous rooms
-        # 1. Add to the main room index
-        if room_id not in self.rooms:
-            self.rooms[room_id] = []
-        if websocket not in self.rooms[room_id]:
-            self.rooms[room_id].append(websocket)
+        # 1. Add to the appropriate room dictionary based on type.
+        if isinstance(room_id, int):
+            if room_id not in self.party_rooms:
+                self.party_rooms[room_id] = []
+            if websocket not in self.party_rooms[room_id]:
+                self.party_rooms[room_id].append(websocket)
+        else:
+            if room_id not in self.observation_rooms:
+                self.observation_rooms[room_id] = []
+            if websocket not in self.observation_rooms[room_id]:
+                self.observation_rooms[room_id].append(websocket)
 
         # 2. Add to the socket's personal room set
         if websocket not in self.socket_to_rooms:
@@ -93,17 +108,22 @@ class WebSocketConnectionManager:
         logger.info(f"User '{username}' joined room '{room_id}'.")
 
     async def leave_room(self, websocket: WebSocket, room_id: Union[int, str]):
-        # CHANGED: Must specify which room to leave
         self.leave_room_sync(websocket, room_id)
 
     def leave_room_sync(self, websocket: WebSocket, room_id: Union[int, str]):
-        # CHANGED: Must specify which room to leave
-        # 1. Remove from the main room index
-        if room_id in self.rooms:
-            if websocket in self.rooms[room_id]:
-                self.rooms[room_id].remove(websocket)
-            if not self.rooms[room_id]:
-                del self.rooms[room_id]
+        # 1. Remove from the appropriate room dictionary.
+        if isinstance(room_id, int):
+            if room_id in self.party_rooms:
+                if websocket in self.party_rooms[room_id]:
+                    self.party_rooms[room_id].remove(websocket)
+                if not self.party_rooms[room_id]:
+                    del self.party_rooms[room_id]
+        else:
+            if room_id in self.observation_rooms:
+                if websocket in self.observation_rooms[room_id]:
+                    self.observation_rooms[room_id].remove(websocket)
+                if not self.observation_rooms[room_id]:
+                    del self.observation_rooms[room_id]
 
         # 2. Remove from the socket's personal room set
         if websocket in self.socket_to_rooms and room_id in self.socket_to_rooms[websocket]:
@@ -115,9 +135,28 @@ class WebSocketConnectionManager:
         username = user_data.get('username') if user_data else 'Unknown'
         logger.info(f"User '{username}' left room '{room_id}'.")
 
+    async def remove_user_from_room(self, user_id: int, room_id: Union[int, str]):
+        """Removes all of a user's connections from a specific room."""
+        connections = self.active_connections.get(user_id, [])
+        if not connections:
+            return
+
+        # Use a copy of the list to iterate while modifying the original state via leave_room_sync
+        for websocket in list(connections):
+            self.leave_room_sync(websocket, room_id)
+
+        # Get user data from any connection for logging
+        if connections:
+            user_data = self.get_user_for_websocket(connections[0])
+            username = user_data.get('username') if user_data else 'Unknown'
+            logger.info(f"Removed all connections for user '{username}' (ID: {user_id}) from room '{room_id}'.")
+
     async def broadcast_to_room(self, room_id: Union[int, str], message: dict, sender_websocket: Optional[WebSocket] = None):
-        # ... (this method is unchanged)
-        sockets_in_room = self.rooms.get(room_id)
+        if isinstance(room_id, int):
+            sockets_in_room = self.party_rooms.get(room_id)
+        else:
+            sockets_in_room = self.observation_rooms.get(room_id)
+
         if not sockets_in_room:
             return
         message_str = json.dumps(message)
@@ -130,8 +169,8 @@ class WebSocketConnectionManager:
             await asyncio.gather(*send_tasks, return_exceptions=True)
 
     # NEW HELPER METHODS
-    def get_chat_room_for_websocket(self, websocket: WebSocket) -> Optional[int]:
-        """Finds the integer-based chat room for a given WebSocket."""
+    def get_party_room_for_websocket(self, websocket: WebSocket) -> Optional[int]:
+        """Finds the integer-based party room for a given WebSocket."""
         user_rooms = self.socket_to_rooms.get(websocket, set())
         for room_id in user_rooms:
             if isinstance(room_id, int):
@@ -142,6 +181,22 @@ class WebSocketConnectionManager:
         """Gets the set of all rooms for a WebSocket."""
         return self.socket_to_rooms.get(websocket, set())
     
+    async def send_personal_message_to_user(self, user_id: int, message: dict):
+        """Sends a JSON message to all active connections for a specific user."""
+        if user_id is None:
+            logger.error(f"Attempted to send personal message to a user with ID None.")
+            return
+
+        connections = self.active_connections.get(user_id)
+        if not connections:
+            # This is not an error, the user might just be offline.
+            return
+
+        message_str = json.dumps(message)
+        send_tasks = [conn.send_text(message_str) for conn in connections]
+        if send_tasks:
+            await asyncio.gather(*send_tasks, return_exceptions=True)
+
     # ... (send_json_message, send_personal_message, and singleton logic are unchanged) ...
     async def send_json_message(self, message: dict, websocket: WebSocket):
         try:

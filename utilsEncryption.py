@@ -52,24 +52,15 @@ async def is_hash_in_db(file_hash: str) -> bool:
         # Return False to prevent crashes; the file will be treated as non-existent in the DB.
         return False
 
-# --- UNCHANGED UTILITY FUNCTIONS ---
 
-def calculate_file_hash(filepath):
+
+def calculate_file_hash(filepath: str) -> str:
     """Calculates the SHA256 hash of a file."""
     sha256_hash = hashlib.sha256()
     with open(filepath, "rb") as f:
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
-
-def calculate_file_hash(filepath):
-    """Calculates the SHA256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
-
 
 def _derive_key(password: bytes, salt: bytes) -> bytes:
     """Derives a cryptographic key from a password and salt."""

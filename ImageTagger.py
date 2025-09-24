@@ -6,12 +6,15 @@ import sys
 import time
 import asyncio
 import aiohttp
+import torch
+import torchvision.transforms.functional as TF
 import numpy as np
 from PIL import Image
 from onnxruntime import InferenceSession, get_available_providers
 
-# --- Configuration ---
-IDLE_UNLOAD_SECONDS = 1800  # Unload models after 30 minutes (1800 seconds) of inactivity.
+
+# --- Device Setup ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Map model names to their Hugging Face repository IDs
 MODELS_CONFIG = {
@@ -27,6 +30,20 @@ _model_cache = {}
 # A lock to prevent race conditions when modifying the cache from multiple asyncio tasks.
 _cache_lock = asyncio.Lock()
 
+async def check_and_unload_idle_taggers(idle_timeout_seconds: int):
+    """
+    Iterates through the cached tagger models and unloads any that have been
+    idle for longer than the specified timeout.
+    """
+    if idle_timeout_seconds <= 0:
+        return
+
+    async with _cache_lock:
+        # Iterate over a copy of the items to allow modification of the cache
+        for model_name, tagger in list(_model_cache.items()):
+            if tagger.is_loaded() and (time.time() - tagger.last_used) > idle_timeout_seconds:
+                print(f"[Tagger] Model '{model_name}' has been idle for over {idle_timeout_seconds}s. Unloading.")
+                tagger.unload()
 
 async def _download_to_file(url: str, dest_path: str, progress_callback, session: aiohttp.ClientSession):
     """Asynchronously downloads a file and streams it to a destination path, with progress."""
@@ -200,7 +217,6 @@ class Tagger:
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
         
         self.model = InferenceSession(onnx_path, providers=providers)
-        
         # 3. --- GET MODEL-SPECIFIC INFO ---
         self.input_name = self.model.get_inputs()[0].name
         self.input_height = self.model.get_inputs()[0].shape[1]
@@ -244,65 +260,102 @@ class Tagger:
                 ordered_tags.append((row[1], int(row[2]))) 
         return ordered_tags
 
+    def _preprocess_image_to_tensor(self, image: Image.Image) -> torch.Tensor:
+        """Preprocesses a single PIL image and returns a ready-to-batch tensor on the correct device."""
+        # 1. Convert PIL to Tensor and move to GPU
+        img_tensor = TF.to_tensor(image).to(DEVICE)
+
+        # 2. Resize on GPU
+        h, w = img_tensor.shape[1:]
+        ratio = float(self.input_height) / max(h, w)
+        new_h, new_w = int(h * ratio), int(w * ratio)
+        img_tensor = TF.resize(img_tensor, [new_h, new_w], interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
+
+        # 3. Pad to square on GPU
+        square = torch.ones((3, self.input_height, self.input_height), device=DEVICE)
+        paste_x = (self.input_height - new_w) // 2
+        paste_y = (self.input_height - new_h) // 2
+        square[:, paste_y:paste_y+new_h, paste_x:paste_x+new_w] = img_tensor
+
+        # 4. Prepare for ONNX model format (but keep on GPU for now)
+        # The model expects (B, H, W, C) in BGR, float32, and values in [0, 255].
+        # Our tensor is (C, H, W) in RGB, float32, and values in [0, 1].
+        square = square.permute(1, 2, 0)      # H, W, C
+        square = square * 255.0               # Scale to 0-255
+        square = square[:, :, [2, 1, 0]]      # RGB -> BGR
+        return square
+
     def tag(self, image: Image.Image, threshold=0.35, character_threshold=0.85, 
             exclude_tags="", replace_underscore=True) -> list[str]:
         """
         Processes and tags a single PIL Image.
+        This is a convenience wrapper around `tag_batch`.
+        """
+        batch_results = self.tag_batch([image], threshold, character_threshold, exclude_tags, replace_underscore)
+        return batch_results[0] if batch_results else []
+
+    def tag_batch(self, images: list[Image.Image], threshold=0.35, character_threshold=0.85, 
+                  exclude_tags="", replace_underscore=True) -> list[list[str]]:
+        """
+        Processes and tags a batch of PIL Images for higher GPU utilization.
 
         This is a synchronous, CPU/GPU-bound function. It should be run in a
         separate thread (e.g., using `run_in_executor`) to avoid blocking
         an asyncio event loop.
 
         Args:
-            image: The PIL Image object to tag.
+            images: A list of PIL Image objects to tag.
             threshold: Confidence threshold for general tags (category 0).
             character_threshold: Confidence threshold for character tags (category 4).
             exclude_tags: A comma-separated string of tags to exclude.
             replace_underscore: If True, replaces underscores in tags with spaces.
 
         Returns:
-            A list of tag strings.
+            A list of lists, where each inner list contains the tag strings for the
+            corresponding image in the input batch.
         """
         if not self.is_loaded() or self.model is None or not self.tags:
             raise RuntimeError(f"Model '{self.model_name}' is not loaded. Cannot perform tagging.")
         
+        if not images:
+            return []
+
         self.touch()
 
-        # 1. --- PRE-PROCESS THE IMAGE (CPU-bound) ---
-        ratio = float(self.input_height) / max(image.size)
-        new_size = tuple([int(x * ratio) for x in image.size])
-        image = image.resize(new_size, Image.LANCZOS)
-        square = Image.new("RGB", (self.input_height, self.input_height), (255, 255, 255))
-        square.paste(image, ((self.input_height - new_size[0]) // 2, (self.input_height - new_size[1]) // 2))
+        # --- PRE-PROCESS THE IMAGE (GPU-accelerated) ---
+        batch_tensors = [self._preprocess_image_to_tensor(img) for img in images]
 
-        image_np = np.array(square).astype(np.float32)
-        image_np = image_np[:, :, ::-1]  # RGB -> BGR
-        image_np = np.expand_dims(image_np, 0)
+        # Stack into a single batch tensor and move to CPU for ONNX Runtime
+        batch_np = torch.stack(batch_tensors).cpu().numpy()
 
-        # 2. --- RUN INFERENCE (GPU-bound) ---
-        probs = self.model.run([self.output_name], {self.input_name: image_np})[0][0]
+        # --- RUN INFERENCE (GPU-bound) ---
+        all_probs = self.model.run([self.output_name], {self.input_name: batch_np})[0]
         
-        # 3. --- POST-PROCESS RESULTS (CPU-bound) ---
-        general_tags = []
-        character_tags = []
-
-        for (tag_name, category), probability in zip(self.tags, probs):
-            if category == 0 and probability > threshold:
-                general_tags.append(tag_name)
-            elif category == 4 and probability > character_threshold:
-                character_tags.append(tag_name)
-        
-        combined_tags = character_tags + general_tags
-        
+        # --- POST-PROCESS RESULTS (CPU-bound) ---
+        batch_final_tags = []
         remove_set = {s.strip().lower() for s in exclude_tags.lower().split(",") if s}
-        
-        final_tags = []
-        for tag in combined_tags:
-            formatted_tag = tag.replace("_", " ") if replace_underscore else tag
-            if formatted_tag.lower() not in remove_set:
-                final_tags.append(formatted_tag)
+
+        for probs in all_probs:
+            general_tags = []
+            character_tags = []
+
+            for (tag_name, category), probability in zip(self.tags, probs):
+                if category == 0 and probability > threshold:
+                    general_tags.append(tag_name)
+                elif category == 4 and probability > character_threshold:
+                    character_tags.append(tag_name)
+            
+            combined_tags = character_tags + general_tags
+            
+            final_tags = []
+            for tag in combined_tags:
+                formatted_tag = tag.replace("_", " ") if replace_underscore else tag
+                if formatted_tag.lower() not in remove_set:
+                    final_tags.append(formatted_tag)
+            
+            batch_final_tags.append(final_tags)
                 
-        return final_tags
+        return batch_final_tags
 
 # --- Example Usage (for testing the module directly) ---
 if __name__ == '__main__':

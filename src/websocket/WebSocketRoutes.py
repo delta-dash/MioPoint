@@ -22,9 +22,11 @@ from src.messaging.messaging_service import delete_watch_party_thread, get_threa
 # --- This import is critical! It runs the code in the handler files,
 # which registers their functions with the dispatcher instance.
 from src.websocket import handlers 
+from utils import logging_handler
 
 logger = logging.getLogger("WebSocket")
 logger.setLevel(logging.DEBUG)
+logger.addHandler(logging_handler)
 router = APIRouter(prefix="/api/ws", tags=["Websocket"])
 
 # Get singleton instances
@@ -108,53 +110,17 @@ async def handle_websocket_messages(websocket: WebSocket):
     
     except WebSocketDisconnect:
         logger.info(f"Client disconnected: {username} ({websocket.client.host}:{websocket.client.port})")
-        
-        # --- AUTOMATIC WATCH PARTY CLEANUP LOGIC ---
-        # 1. Get user and room info BEFORE disconnecting them from the manager.
-        user_data = manager.get_user_for_websocket(websocket)
-        thread_id = manager.get_chat_room_for_websocket(websocket)
-
-        # 2. Get the file_id if they were in a watch party, needed for the final update.
-        file_id = None
-        if thread_id:
-            thread_details = await get_thread_details(thread_id)
-            if thread_details:
-                file_id = thread_details.get('content_id')
-
-        # 3. Now, perform the actual cleanup in the connection manager.
-        await manager.disconnect(websocket)
-
-        # 4. After cleanup, perform notifications and checks.
-        if thread_id and user_data:
-            # Notify any remaining party members that this user has left.
-            notification = {
-                "type": "user_left_party",
-                "payload": {"id": user_data.get('id'), "username": user_data.get('username')}
-            }
-            await manager.broadcast_to_room(thread_id, notification)
-
-            # 5. CORE LOGIC: Check if the party is now empty.
-            if not manager.rooms.get(thread_id):
-                was_deleted = await delete_watch_party_thread(thread_id=thread_id)
-                if was_deleted:
-                    logger.info(f"Watch party {thread_id} was empty after disconnect and has been automatically deleted.")
-            
-            # 6. Finally, notify everyone viewing the file page that the list of parties
-            # has changed (either member count decreased or party was removed).
-            if file_id:
-                observation_room = f"file-viewers:{file_id}"
-                update_message = {"type": "party_list_updated", "payload": {"fileId": file_id}}
-                await manager.broadcast_to_room(observation_room, update_message)
+        # Create a synthetic event for the dispatcher to handle all cleanup logic,
+        # such as notifying party members and disconnecting from the manager.
+        await dispatcher.dispatch(manager, websocket, {"type": "client_disconnected", "payload": {}})
 
     except json.JSONDecodeError:
         logger.warning(f"Invalid JSON received from {username}. Closing connection.")
         await manager.send_personal_message("Invalid JSON received. Closing connection.", websocket)
-        # FIX: The disconnect call here must also be awaited.
-        await manager.disconnect(websocket)
+        # Dispatch to the centralized disconnect handler
+        await dispatcher.dispatch(manager, websocket, {"type": "client_disconnected", "payload": {}})
 
     except Exception as e:
         logger.error(f"Error handling WebSocket messages for {username}: {e}", exc_info=True)
         # Avoid sending detailed errors to the client for security.
         await manager.send_personal_message("An internal server error occurred.", websocket)
-        # FIX: The disconnect call here must also be awaited.
-        await manager.disconnect(websocket)

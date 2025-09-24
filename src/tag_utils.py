@@ -7,6 +7,6 @@ def _get_table_names(tag_type: str) -> dict:
     return {
         "main": tag_type,
         "relationships": f"{base_name}_relationships",
-        "file_junction": f"file_{tag_type}",
+        "file_junction": f"file_content_{tag_type}",
         "scene_junction": f"scene_{tag_type}",
     }

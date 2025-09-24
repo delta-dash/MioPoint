@@ -43,6 +43,7 @@ async def setup_tags_database_with_loop_async(conn: Optional[aiosqlite.Connectio
                     id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL UNIQUE,
                     canonical_tag_id INTEGER,
+                    is_protection_tag INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (canonical_tag_id) REFERENCES {tables['main']} (id) ON DELETE SET NULL
                 );""")
                 await db_conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{tables['main']}_canonical_id ON {tables['main']} (canonical_tag_id);")
@@ -59,11 +60,11 @@ async def setup_tags_database_with_loop_async(conn: Optional[aiosqlite.Connectio
 
                 await db_conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {tables['file_junction']} (
-                    file_id INTEGER NOT NULL,
+                    content_id INTEGER NOT NULL,
                     tag_id INTEGER NOT NULL,
-                    FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE,
+                    FOREIGN KEY (content_id) REFERENCES file_content (id) ON DELETE CASCADE,
                     FOREIGN KEY (tag_id) REFERENCES {tables['main']} (id) ON DELETE CASCADE,
-                    PRIMARY KEY (file_id, tag_id)
+                    PRIMARY KEY (content_id, tag_id)
                 );""")
                 await db_conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{tables['file_junction']}_tag_id ON {tables['file_junction']} (tag_id);")
 
@@ -133,7 +134,8 @@ async def create_tag(
     tag_type: str,
     conn: Optional[aiosqlite.Connection] = None,
     parents: Optional[List[Union[int, str]]] = None,
-    alias_of: Optional[Union[int, str]] = None
+    alias_of: Optional[Union[int, str]] = None,
+    is_protection_tag: bool = False
 ) -> Optional[int]:
     """
     Asynchronously creates a new tag or meta_tag. If `alias_of` is a name that
@@ -160,8 +162,8 @@ async def create_tag(
                 if not canonical_id:
                     raise ValueError(f"Failed to resolve or create canonical tag '{alias_of}'.")
 
-            sql = f"INSERT INTO {tables['main']} (name, canonical_tag_id) VALUES (?, ?)"
-            params = (tag_name, canonical_id)
+            sql = f"INSERT INTO {tables['main']} (name, canonical_tag_id, is_protection_tag) VALUES (?, ?, ?)"
+            params = (tag_name, canonical_id, int(is_protection_tag))
             new_tag_id = await execute_db_query(db_conn, sql, params, return_last_row_id=True)
             logger.info(f"Created tag '{tag_name}' (ID: {new_tag_id}) in '{tables['main']}'.")
 
@@ -292,6 +294,13 @@ async def edit_tag(
             await execute_db_query(conn, f"UPDATE {tables['main']} SET name = ? WHERE id = ?", (new_name, tag_id))
             logger.debug(f"Renamed tag ID {tag_id} to '{new_name}'.")
 
+        # Handle is_protection_tag update
+        if 'is_protection_tag' in updates and updates['is_protection_tag'] is not None:
+            is_protection = int(updates['is_protection_tag'])
+            await execute_db_query(conn, f"UPDATE {tables['main']} SET is_protection_tag = ? WHERE id = ?", (is_protection, tag_id))
+            logger.debug(f"Updated is_protection_tag for tag ID {tag_id} to {is_protection}.")
+
+
         # Handle parent overwrite
         if 'parents' in updates:
             current_tag_info = await execute_db_query(conn, f"SELECT canonical_tag_id FROM {tables['main']} WHERE id = ?", (tag_id,), fetch_one=True)
@@ -354,51 +363,65 @@ async def remove_tag(
             return False
 
 async def assign_tags_to_file(
-    file_id: int,
+    instance_id: int,
     tags: List[Union[int, str]],
     tag_type: str,
     conn: Optional[aiosqlite.Connection] = None
 ) -> bool:
     """
-    Asynchronously assigns one or more tags to a specific file.
+    Asynchronously assigns one or more tags to a specific file's content.
     """
     if not tags:
         return True
 
     async with AsyncDBContext(conn) as db_conn:
         try:
+            # Get content_id from instance_id
+            content_row = await execute_db_query(db_conn, "SELECT content_id FROM file_instances WHERE id = ?", (instance_id,), fetch_one=True)
+            if not content_row:
+                logger.warning(f"No instance found with ID {instance_id}. Cannot assign tags.")
+                return False
+            content_id = content_row['content_id']
+
             tables = _get_table_names(tag_type)
             
             tag_ids_to_assign = await _resolve_tag_ids(tags, tag_type, db_conn)
             if not tag_ids_to_assign:
-                logger.warning(f"No valid tags found from input {tags} to assign for file ID {file_id}.")
+                logger.warning(f"No valid tags found from input {tags} to assign for instance ID {instance_id}.")
                 return False
 
-            assignments = [(file_id, tag_id) for tag_id in tag_ids_to_assign]
-            sql = f"INSERT OR IGNORE INTO {tables['file_junction']} (file_id, tag_id) VALUES (?, ?)"
+            assignments = [(content_id, tag_id) for tag_id in tag_ids_to_assign]
+            sql = f"INSERT OR IGNORE INTO {tables['file_junction']} (content_id, tag_id) VALUES (?, ?)"
             await db_conn.executemany(sql, assignments)
-            logger.debug(f"Assigned tags {tag_ids_to_assign} to file ID {file_id} in '{tables['file_junction']}'.")
+            logger.debug(f"Assigned tags {tag_ids_to_assign} to content ID {content_id} (from instance ID {instance_id}) in '{tables['file_junction']}'.")
             return True
 
         except (aiosqlite.Error, ValueError) as e:
-            logger.warning(f"Operation failed in assign_tags_to_file for file {file_id}: {e}")
+            logger.warning(f"Operation failed in assign_tags_to_file for instance {instance_id}: {e}")
             return False
 
 
 async def unassign_tags_from_file(
-    file_id: int,
+    instance_id: int,
     tags: List[Union[int, str]],
     tag_type: str,
     conn: Optional[aiosqlite.Connection] = None
 ) -> bool:
     """
-    Asynchronously unassigns one or more tags from a specific file.
+    Asynchronously unassigns one or more tags from a specific file's content.
     """
     if not tags:
         return True
 
     async with AsyncDBContext(conn) as db_conn:
         try:
+            # Get content_id from instance_id
+            content_row = await execute_db_query(db_conn, "SELECT content_id FROM file_instances WHERE id = ?", (instance_id,), fetch_one=True)
+            if not content_row:
+                logger.warning(f"No instance found with ID {instance_id}. Cannot unassign tags.")
+                return False
+            content_id = content_row['content_id']
+
             tables = _get_table_names(tag_type)
             
             tag_ids_to_remove = await _resolve_tag_ids(tags, tag_type, db_conn)
@@ -406,15 +429,15 @@ async def unassign_tags_from_file(
                 return True
 
             placeholders = ', '.join('?' for _ in tag_ids_to_remove)
-            sql = f"DELETE FROM {tables['file_junction']} WHERE file_id = ? AND tag_id IN ({placeholders})"
-            params = (file_id, *tag_ids_to_remove)
+            sql = f"DELETE FROM {tables['file_junction']} WHERE content_id = ? AND tag_id IN ({placeholders})"
+            params = (content_id, *tag_ids_to_remove)
             
             await execute_db_query(db_conn, sql, params)
-            logger.debug(f"Unassigned tags {tag_ids_to_remove} from file ID {file_id} in '{tables['file_junction']}'.")
+            logger.debug(f"Unassigned tags {tag_ids_to_remove} from content ID {content_id} (from instance ID {instance_id}) in '{tables['file_junction']}'.")
             return True
 
         except (aiosqlite.Error, ValueError) as e:
-            logger.warning(f"Operation failed in unassign_tags_from_file for file {file_id}: {e}")
+            logger.warning(f"Operation failed in unassign_tags_from_file for instance {instance_id}: {e}")
             return False
 
 async def get_visible_tags_for_user(user_id: int, tag_type: str, conn: Optional[aiosqlite.Connection] = None) -> list[dict]:
@@ -503,7 +526,7 @@ async def get_tag_data(
         column_to_query = "name"
         identifier_value = tag_name
 
-    query = f"SELECT id, name, canonical_tag_id FROM {tables['main']} WHERE {column_to_query} = ?"
+    query = f"SELECT id, name, canonical_tag_id, is_protection_tag FROM {tables['main']} WHERE {column_to_query} = ?"
     
     main_tag_row = await execute_db_query(conn, query, (identifier_value,), fetch_one=True)
     if not main_tag_row:
@@ -511,7 +534,7 @@ async def get_tag_data(
         return None
 
     result = {
-        "id": main_tag_row['id'], "name": main_tag_row['name'], "type": tag_type,
+        "id": main_tag_row['id'], "name": main_tag_row['name'], "type": tag_type, "is_protection_tag": bool(main_tag_row['is_protection_tag']),
         "is_alias": main_tag_row['canonical_tag_id'] is not None,
         "canonical_tag": None, "aliases": [], "parents": [], "children": []
     }

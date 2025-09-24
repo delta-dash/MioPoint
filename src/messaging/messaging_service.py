@@ -18,7 +18,7 @@ Features:
 """
 import aiosqlite
 import secrets
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import logging
 from src.db_utils import AsyncDBContext, execute_db_query
@@ -312,36 +312,119 @@ async def list_watch_parties_for_file(file_id: int, conn: Optional[aiosqlite.Con
         # Just convert the rows to dicts and return.
         return [dict(party) for party in all_parties]
 
-async def join_watch_party_thread(user_id: int, invite_code: str, conn: Optional[aiosqlite.Connection] = None) -> Optional[int]:
-    """Adds a user to a watch party using its invite code."""
+async def get_user_active_watch_party(user_id: int, conn: Optional[aiosqlite.Connection] = None) -> Optional[Dict[str, Any]]:
+    """
+    Finds the active watch party for a given user, if any.
+    Returns details about the party including thread_id, content_id, and the user's role.
+    """
+    query = """
+        SELECT
+            t.id as thread_id,
+            t.content_id,
+            tm.role
+        FROM thread_members tm
+        JOIN threads t ON tm.thread_id = t.id
+        WHERE tm.user_id = ? AND t.type = 'watch_party'
+        LIMIT 1;
+    """
     async with AsyncDBContext(conn) as db:
-        thread_data = await execute_db_query(db, "SELECT id, content_id FROM threads WHERE invite_code = ? AND type = 'watch_party'", (invite_code,), fetch_one=True)
-        if not thread_data:
+        party_data = await execute_db_query(db, query, (user_id,), fetch_one=True)
+        return dict(party_data) if party_data else None
+
+
+async def join_watch_party_thread(user_id: int, invite_code: str, conn: Optional[aiosqlite.Connection] = None) -> Optional[Dict[str, Any]]:
+    """
+    Adds a user to a watch party. If the user is already in another watch party,
+    they will be removed from it first.
+    Returns a dictionary with details about the join and any party that was left.
+    """
+    async with AsyncDBContext(conn) as db:
+        # 1. Find the party the user wants to join.
+        new_party_data = await execute_db_query(
+            db,
+            "SELECT id, content_id FROM threads WHERE invite_code = ? AND type = 'watch_party'",
+            (invite_code,),
+            fetch_one=True
+        )
+        if not new_party_data:
             logger.warning(f"User {user_id} failed to join watch party: invite code '{invite_code}' not found.")
             return None
+        new_thread_id = new_party_data['id']
 
-        thread_id = thread_data['id']
-        await db.execute("INSERT OR IGNORE INTO thread_members (thread_id, user_id, role) VALUES (?, ?, 'member')", (thread_id, user_id))
+        # 2. Find if the user is in any *other* watch party.
+        old_party_query = """
+            SELECT tm.thread_id, t.content_id
+            FROM thread_members tm
+            JOIN threads t ON tm.thread_id = t.id
+            WHERE tm.user_id = ? AND t.type = 'watch_party' AND t.id != ?
+        """
+        old_party_data = await execute_db_query(db, old_party_query, (user_id, new_thread_id), fetch_one=True)
+
+        left_party_details = None
+        if old_party_data:
+            old_thread_id = old_party_data['thread_id']
+            old_content_id = old_party_data['content_id']
+            logger.info(f"User {user_id} is leaving old watch party {old_thread_id} to join new one {new_thread_id}.")
+            
+            # 3. Remove user from the old party.
+            success, new_owner_id = await leave_thread(user_id=user_id, thread_id=old_thread_id, conn=db)
+            if success:
+                left_party_details = {
+                    "thread_id": old_thread_id,
+                    "content_id": old_content_id,
+                    "new_owner_id": new_owner_id
+                }
+
+        # 4. Add the user to the new party.
+        await db.execute("INSERT OR IGNORE INTO thread_members (thread_id, user_id, role) VALUES (?, ?, 'member')", (new_thread_id, user_id))
+        
         # --- INTEGRATION: LOGGING ---
-        await log_event_async(
-            conn=db,
-            event_type="watch_party_joined",
-            actor_type="user",
-            actor_name=str(user_id),
-            target_type="thread",
-            target_id=thread_id,
-            details={"invite_code": invite_code, "file_id": thread_data['content_id']}
+        await log_event_async(conn=db, event_type="watch_party_joined", actor_type="user", actor_name=str(user_id), target_type="thread", target_id=new_thread_id, details={"invite_code": invite_code, "file_id": new_party_data['content_id']})
+
+        logger.info(f"User {user_id} is now in watch party {new_thread_id} (invite code '{invite_code}').")
+        return {
+            "thread_id": new_thread_id,
+            "left_party": left_party_details
+        }
+
+async def update_watch_party_file(thread_id: int, new_file_id: int, acting_user_id: int, conn: Optional[aiosqlite.Connection] = None) -> bool:
+    """
+    Updates the content_id for a watch party thread.
+    This is typically called when the party owner changes the video.
+    The calling handler is responsible for verifying the user's permission.
+    """
+    async with AsyncDBContext(conn) as db:
+        # We only update threads of type 'watch_party' to be safe.
+        rows_affected = await execute_db_query(
+            db,
+            "UPDATE threads SET content_id = ? WHERE id = ? AND type = 'watch_party'",
+            (new_file_id, thread_id),
         )
 
-        logger.info(f"User {user_id} joined watch party {thread_id} using code '{invite_code}'.")
-        return thread_id
+        if rows_affected > 0:
+            logger.info(f"Watch party thread {thread_id} changed file to content_id {new_file_id} by user {acting_user_id}.")
+            # Log the event
+            await log_event_async(
+                conn=db,
+                event_type="watch_party_file_changed",
+                actor_type="user",
+                actor_name=str(acting_user_id),
+                target_type="thread",
+                target_id=thread_id,
+                details={"new_content_id": new_file_id}
+            )
+            return True
+        else:
+            logger.warning(f"Failed to update file for watch party {thread_id}. It might not exist or is not a watch party.")
+            return False
 
-
-async def leave_thread(user_id: int, thread_id: int, conn: Optional[aiosqlite.Connection] = None):
+async def leave_thread(user_id: int, thread_id: int, conn: Optional[aiosqlite.Connection] = None) -> Tuple[bool, Optional[int]]:
     """
     Removes a user from a thread's member list in the database.
     If the leaving user is the owner, it attempts to transfer ownership.
+    Returns a tuple of (success, new_owner_id).
     """
+    new_owner_id: Optional[int] = None
     async with AsyncDBContext(conn) as db:
         # Get the user's role before they leave
         user_role = await _get_user_thread_role_logic(db, user_id, thread_id)
@@ -390,7 +473,7 @@ async def leave_thread(user_id: int, thread_id: int, conn: Optional[aiosqlite.Co
                         details={"new_owner_id": new_owner_id}
                     )
 
-        return rows_affected > 0
+        return rows_affected > 0, new_owner_id
 
 
 async def delete_watch_party_thread(thread_id: int, conn: Optional[aiosqlite.Connection] = None) -> bool:
@@ -426,17 +509,18 @@ async def delete_watch_party_thread(thread_id: int, conn: Optional[aiosqlite.Con
 # ==============================================================================
 
 async def create_post(sender_id: int, thread_id: int, content: str, parent_id: Optional[int] = None, conn: Optional[aiosqlite.Connection] = None) -> Optional[Dict[str, Any]]:
-    """Creates a post (message or reply). Requires POST_CREATE and membership."""
+    """Creates a post (message or reply). Requires POST_CREATE and membership (except for comment sections)."""
     if not content.strip(): raise ValueError("Content cannot be empty.")
     async with AsyncDBContext(conn) as db:
         if not await user_has_permission(sender_id, Permission.POST_CREATE, db):
             logger.warning(f"User {sender_id} denied post creation: lacks POST_CREATE permission.")
             return None
 
+        # A user can post if they are a member (have a role) OR if it's a public comment section.
         user_role = await _get_user_thread_role_logic(db, sender_id, thread_id)
         thread_info = await execute_db_query(db, "SELECT type, name FROM threads WHERE id=?", (thread_id,), fetch_one=True)
-        is_public = thread_info and thread_info['type'] in ('comment_section', 'watch_party')
-        if not user_role and not is_public:
+        is_comment_section = thread_info and thread_info['type'] == 'comment_section'
+        if not user_role and not is_comment_section:
             logger.warning(f"User {sender_id} tried to post in thread {thread_id} but is not a member.")
             return None
 

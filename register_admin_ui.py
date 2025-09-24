@@ -68,6 +68,8 @@ MDScreen:
             mode: "fill"
             helper_text: "Choose a unique username"
             helper_text_mode: "on_focus"
+            write_tab: False
+            focus_next: password
 
         MDTextField:
             id: password
@@ -77,6 +79,8 @@ MDScreen:
             mode: "fill"
             helper_text: "Use at least 8 characters"
             helper_text_mode: "on_focus"
+            write_tab: False
+            focus_next: username
 
         MDFillRoundFlatButton:
             text: "Create Admin User"
